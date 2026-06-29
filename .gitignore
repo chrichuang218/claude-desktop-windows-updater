@@ -1,0 +1,4 @@
+/target
+/work
+*.pdb
+/sync_dump.xml

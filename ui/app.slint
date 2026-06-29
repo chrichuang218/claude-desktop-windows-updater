@@ -1,0 +1,916 @@
+// Installer wizard. Single window, screen switched by `current-screen`.
+// Installed mode launches Claude directly; this window is used for install/update and uninstall.
+//
+// Screen IDs:
+//   0 Welcome       3 Options
+//   1 Mode          4 Progress
+//   2 Path          5 Done        6 Error
+//  10 Proxy status
+//  11 Checking for updates (splash)
+//  12 Update available (confirm + defer options)
+//  13 Up to date (version comparison + launch choice)
+//  20 Uninstall confirm
+//  21 Uninstall progress   (reuses progress-phase/progress-detail/progress-*)
+//  22 Uninstall done
+//  23 Uninstall error/refused
+//  30 Launcher update prompt
+//  31 Launcher self-update done (restart-to-apply notice)
+
+import { VerticalBox, HorizontalBox, Button, LineEdit, CheckBox, ComboBox } from "std-widgets.slint";
+
+component DarkButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> primary: false;
+    in property <bool> disabled: false;
+    callback clicked;
+    height: 36px;
+    min-width: 96px;
+    border-radius: 7px;
+    background: ta.has-hover && !root.disabled
+        ? (root.primary ? #282520 : #fffaf4)
+        : (root.primary ? #181612 : #fbf6ed);
+    border-width: root.primary ? 0px : 1px;
+    border-color: #d9cfbf;
+    opacity: root.disabled ? 0.5 : 1.0;
+    // HorizontalLayout drives the Rectangle's preferred width from the
+    // Text's measured size + padding. Without a layout the Text is overlaid
+    // and `min-width: 96px` is the only width source — wider labels clip.
+    HorizontalLayout {
+        padding-left: 14px;
+        padding-right: 14px;
+        Text {
+            text: root.text;
+            color: root.primary ? #fffaf2 : #1d1a16;
+            font-size: 12px;
+            font-weight: 600;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+    ta := TouchArea {
+        enabled: !root.disabled;
+        clicked => { root.clicked(); }
+    }
+}
+
+component ModeCard inherits Rectangle {
+    in property <string> title;
+    in property <string> subtitle;
+    in property <bool> selected: false;
+    callback clicked;
+    height: 60px;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: root.selected ? #cfb19e : (ta.has-hover ? #d5c7b5 : #e3d8ca);
+    background: root.selected ? #fff8ef : (ta.has-hover ? #fffaf3 : #fffdf8);
+    Rectangle {
+        x: 0px;
+        y: 0px;
+        width: 3px;
+        height: parent.height;
+        border-radius: 1.5px;
+        background: root.selected ? #c86f52 : #00000000;
+    }
+    VerticalBox {
+        padding-left: 16px;
+        padding-right: 16px;
+        padding-top: 9px;
+        padding-bottom: 9px;
+        spacing: 4px;
+        Text {
+            text: root.title;
+            color: #1d1a16;
+            font-size: 13px;
+            font-weight: 600;
+        }
+        Text {
+            text: root.subtitle;
+            color: #7b7165;
+            font-size: 11px;
+            wrap: word-wrap;
+        }
+    }
+    ta := TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
+component BrandMark inherits Rectangle {
+    in property <float> phase: 0.0;
+    width: 68px;
+    height: 68px;
+    border-radius: root.width * 0.22;
+    background: #efe3d3;
+
+    Image {
+        source: @image-url("../assets/claude_icon.png");
+        x: 0px;
+        y: (root.phase < 0.5 ? root.phase : 1.0 - root.phase) * -3px;
+        width: parent.width;
+        height: parent.height;
+    }
+}
+
+component LanguageSwitch inherits Rectangle {
+    in-out property <int> current: 0;
+    height: 32px;
+    width: 156px;
+    border-radius: 7px;
+    background: #f4ece0;
+    border-width: 1px;
+    border-color: #ddd1bf;
+
+    Rectangle {
+        x: root.current == 0 ? 3px : parent.width / 2;
+        y: 3px;
+        width: parent.width / 2 - 3px;
+        height: parent.height - 6px;
+        border-radius: 5px;
+        background: #fffaf3;
+        border-width: 1px;
+        border-color: #e2d7c6;
+    }
+    HorizontalBox {
+        padding: 3px;
+        Rectangle {
+            width: parent.width / 2 - 3px;
+            Text {
+                text: "简体中文";
+                color: root.current == 0 ? #1d1a16 : #7c7266;
+                font-size: 12px;
+                font-weight: root.current == 0 ? 600 : 500;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            TouchArea { clicked => { root.current = 0; } }
+        }
+        Rectangle {
+            width: parent.width / 2 - 3px;
+            Text {
+                text: "English";
+                color: root.current == 1 ? #1d1a16 : #7c7266;
+                font-size: 12px;
+                font-weight: root.current == 1 ? 600 : 500;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            TouchArea { clicked => { root.current = 1; } }
+        }
+    }
+}
+
+component MotionBar inherits Rectangle {
+    in property <float> value: 0.0;
+    in property <bool> indeterminate: false;
+    in property <float> phase: 0.0;
+    in property <color> accent: #c86f52;
+    height: 8px;
+    border-radius: 4px;
+    background: #e8ddd0;
+    clip: true;
+
+    Rectangle {
+        x: root.indeterminate ? (root.phase * parent.width * 1.24 - parent.width * 0.34) : 0px;
+        y: 0px;
+        height: parent.height;
+        width: root.indeterminate ? parent.width * 0.34 : parent.width * root.value;
+        border-radius: parent.border-radius;
+        background: root.accent;
+    }
+}
+
+component VersionPair inherits Rectangle {
+    in property <string> left-label;
+    in property <string> left-value;
+    in property <string> right-label;
+    in property <string> right-value;
+    height: 66px;
+    border-radius: 8px;
+    background: #fffaf3;
+    border-width: 1px;
+    border-color: #e3d8ca;
+
+    HorizontalBox {
+        padding-left: 18px;
+        padding-right: 18px;
+        spacing: 30px;
+        VerticalBox {
+            spacing: 4px;
+            Text { text: root.left-label; color: #8a8072; font-size: 10px; }
+            Text { text: root.left-value; color: #1d1a16; font-size: 14px; font-weight: 600; }
+        }
+        VerticalBox {
+            spacing: 4px;
+            Text { text: root.right-label; color: #8a8072; font-size: 10px; }
+            Text { text: root.right-value; color: #c86f52; font-size: 14px; font-weight: 600; }
+        }
+        Rectangle {}
+    }
+}
+
+export component AppWindow inherits Window {
+    // Wizard state (bound both ways — UI writes, Rust reads at install time).
+    in-out property <int> current-screen: 0;
+    in-out property <int> install-mode: 1; // 0=portable 1=user 2=system
+    in-out property <string> install-path;
+    in-out property <bool> create-shortcut: true;
+    in-out property <bool> register-uninstall: true;
+    in-out property <int> fetcher: 0; // 0=official 1=local msix 2=extract diagnostic
+    in-out property <string> msix-path: "";
+    in-out property <bool> keep-downloads: false;
+    in-out property <int> language: 0; // 0=zh-CN 1=en-US
+    property <bool> zh: language == 0;
+    property <string> app-title: "Claude Desktop Updater";
+    in-out property <float> motion-tick: 0.0;
+
+    // Progress / status (Rust writes, UI reads).
+    in property <string> progress-phase: "";
+    in property <string> progress-detail: "";
+    in property <float> progress-fraction: 0.0;
+    in property <bool> progress-indeterminate: false;
+    in property <string> error-text: "";
+    in property <string> installed-version: "";
+
+    // Proxy-mode status (screen 10).
+    in property <string> proxy-status: "";
+
+    // Update flow (screens 11/12/13).
+    in property <string> update-current-version: "";
+    in property <string> update-latest-version: "";
+    in property <string> update-error-text: "";
+
+    // Uninstall flow (screens 20/21/22/23).
+    in property <string> uninstall-log-path: "";
+
+    // Launcher self-update prompt (screen 30).
+    in property <string> launcher-current-version: "";
+    in property <string> launcher-latest-version: "";
+    // Empty means "no launcher update pending"; non-empty is the URL to open
+    // when the user clicks "View release".
+    in property <string> launcher-release-url: "";
+
+    // Callbacks to Rust.
+    callback request-install();
+    callback request-cancel();
+    callback request-launch();
+    callback request-quit();
+    callback mode-selected(int);
+    callback path-browse();
+    callback msix-browse();
+    // Update-flow callbacks. defer-choice encodes: 0=UpdateNow, 1=NotNow,
+    // 2=SkipThisVersion, 3=SnoozeOneDay, 4=SnoozeSevenDays, 5=Never.
+    callback request-update(int);
+    callback request-check-updates();
+    callback request-uninstall-start();
+    // Launcher prompt callbacks. action encodes: 0=ViewRelease (doesn't dismiss),
+    // 1=NotNow, 2=SkipThisVersion, 3=SnoozeOneDay, 4=SnoozeSevenDays, 5=Never,
+    // 6=ApplyUpdate (download + replace running launcher).
+    callback request-launcher-action(int);
+
+    title: app-title;
+    icon: @image-url("../assets/claude_icon.png");
+    width: 620px;
+    height: 462px;
+    background: #f5efe6;
+    default-font-family: root.zh ? "Noto Sans SC" : "Segoe UI";
+    // Launcher self-update reminder is pinned only on screen 30 so other screens behave normally.
+    always-on-top: current-screen == 30 || current-screen == 31;
+
+    VerticalBox {
+        padding-left: 28px;
+        padding-right: 28px;
+        padding-top: 26px;
+        padding-bottom: 22px;
+        spacing: 15px;
+
+        // Header
+        HorizontalBox {
+            padding: 0px;
+            spacing: 11px;
+            BrandMark {
+                phase: root.motion-tick;
+                width: 36px;
+                height: 36px;
+            }
+            Text {
+                text: root.app-title;
+                font-family: "Segoe UI";
+                font-size: 19px;
+                font-weight: 600;
+                color: #1d1a16;
+                vertical-alignment: center;
+            }
+            Rectangle {} // spacer
+            LanguageSwitch {
+                current <=> root.language;
+            }
+            Text {
+                text: root.current-screen == 10 ? "" :
+                      root.current-screen == 11 ? (root.zh ? "正在检查更新" : "Checking for updates") :
+                      root.current-screen == 12 ? (root.zh ? "发现更新" : "Update available") :
+                      root.current-screen == 13 ? (root.zh ? "已是最新" : "Up to date") :
+                      root.current-screen == 20 ? (root.zh ? "卸载 Claude Desktop Updater" : "Uninstall Claude Desktop Updater") :
+                      root.current-screen == 21 ? (root.zh ? "正在卸载..." : "Uninstalling...") :
+                      root.current-screen == 22 ? (root.zh ? "卸载完成" : "Uninstall complete") :
+                      root.current-screen == 23 ? (root.zh ? "卸载失败" : "Uninstall failed") :
+                      root.current-screen == 30 ? (root.zh ? "启动器有更新" : "Launcher update available") :
+                      root.current-screen == 31 ? (root.zh ? "启动器已更新" : "Launcher updated") :
+                      root.current-screen == 0 ? (root.zh ? "欢迎" : "Welcome") :
+                      root.current-screen == 1 ? (root.zh ? "第 1 / 3 步" : "Step 1 / 3") :
+                      root.current-screen == 2 ? (root.zh ? "第 2 / 3 步" : "Step 2 / 3") :
+                      root.current-screen == 3 ? (root.zh ? "第 3 / 3 步" : "Step 3 / 3") :
+                      root.current-screen == 4 ? (root.zh ? "正在处理..." : "Working...") :
+                      root.current-screen == 5 ? (root.zh ? "完成" : "Done") : (root.zh ? "错误" : "Error");
+                color: #83786a;
+                font-size: 12px;
+                vertical-alignment: center;
+            }
+        }
+        Rectangle { height: 1px; background: #e2d8c9; }
+
+        // Body (screen-specific)
+        Rectangle {
+            vertical-stretch: 1;
+
+            // Welcome
+            if root.current-screen == 0 : VerticalBox {
+                spacing: 11px;
+                Rectangle { height: 6px; }
+                BrandMark {
+                    phase: root.motion-tick;
+                    width: 70px;
+                    height: 70px;
+                }
+                Text {
+                    text: root.zh ? "Claude Desktop 的非官方更新与 Windows 注册修复工具。" : "Unofficial updater and registration repair tool for Claude Desktop.";
+                    color: #1d1a16;
+                    font-size: 18px;
+                    font-weight: 600;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: root.zh ? "使用 Anthropic 官方安装器元数据，并在更新后验证和修复 Windows Appx 注册。" : "Uses Anthropic's official installer metadata, then verifies and repairs Windows Appx registration.";
+                    color: #6d6358;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                }
+                Rectangle { height: 8px; }
+                Text { text: root.zh ? "点击下一步选择安装位置。" : "Click Next to choose where to install."; color: #6d6358; font-size: 12px; }
+            }
+
+            // Mode
+            if root.current-screen == 1 : VerticalBox {
+                spacing: 9px;
+                Text {
+                    text: root.zh ? "Claude Desktop Updater 要安装到哪里？" : "Where should the Claude Desktop updater be installed?";
+                    color: #1d1a16;
+                    font-size: 14px;
+                    font-weight: 600;
+                }
+                ModeCard {
+                    title: root.zh ? "便携模式" : "Portable";
+                    subtitle: root.zh ? "放在一个独立文件夹里。不写注册表，不自动创建快捷方式。" : "Self-contained folder. No registry, no shortcuts unless you add them.";
+                    selected: root.install-mode == 0;
+                    clicked => { root.install-mode = 0; root.mode-selected(0); }
+                }
+                ModeCard {
+                    title: root.zh ? "用户安装  (推荐)" : "User install  (recommended)";
+                    subtitle: root.zh ? "%LOCALAPPDATA%\\ClaudeDesktopUpdater - 不需要管理员权限。" : "%LOCALAPPDATA%\\ClaudeDesktopUpdater - no admin required.";
+                    selected: root.install-mode == 1;
+                    clicked => { root.install-mode = 1; root.mode-selected(1); }
+                }
+                ModeCard {
+                    title: root.zh ? "系统安装" : "System install";
+                    subtitle: root.zh ? "C:\\Program Files\\ClaudeDesktopUpdater - 需要管理员，所有用户共享。" : "C:\\Program Files\\ClaudeDesktopUpdater - requires admin, shared across users.";
+                    selected: root.install-mode == 2;
+                    clicked => { root.install-mode = 2; root.mode-selected(2); }
+                }
+            }
+
+            // Path
+            if root.current-screen == 2 : VerticalBox {
+                spacing: 8px;
+                Text { text: root.zh ? "安装位置" : "Install location"; color: #1d1a16; font-size: 14px; font-weight: 700; }
+                HorizontalBox {
+                    padding: 0px;
+                    spacing: 8px;
+                    LineEdit {
+                        text <=> root.install-path;
+                        horizontal-stretch: 1;
+                    }
+                    DarkButton { text: root.zh ? "浏览..." : "Browse..."; clicked => { root.path-browse(); } }
+                }
+                Text { text: root.zh ? "这个文件夹保存更新器、updater.json、downloads 以及 versions/current junction。" : "This folder stores the updater executable, updater.json, downloads, and versions/current junctions."; color: #83786a; font-size: 11px; wrap: word-wrap; }
+            }
+
+            // Options
+            if root.current-screen == 3 : VerticalBox {
+                spacing: 12px;
+                Text { text: root.zh ? "选项" : "Options"; color: #1d1a16; font-size: 14px; font-weight: 700; }
+
+                CheckBox { text: root.zh ? "创建开始菜单快捷方式" : "Create Start Menu shortcut"; checked <=> root.create-shortcut; }
+                CheckBox {
+                    text: root.zh ? "注册到添加/删除程序（支持一键卸载）" : "Register in Add/Remove Programs (enables one-click uninstall)";
+                    checked <=> root.register-uninstall;
+                }
+                HorizontalBox {
+                    padding: 0px;
+                    spacing: 8px;
+                    Text { text: root.zh ? "来源：" : "Source:"; color: #1d1a16; vertical-alignment: center; }
+                    ComboBox {
+                        model: root.zh ? ["官方安装器  (推荐)", "本地 MSIX", "解包诊断"] : ["Official installer  (recommended)", "Local MSIX", "Extract diagnostic"];
+                        current-index <=> root.fetcher;
+                    }
+                }
+
+                if root.fetcher != 0 : HorizontalBox {
+                    padding: 0px;
+                    spacing: 8px;
+                    LineEdit {
+                        text <=> root.msix-path;
+                        horizontal-stretch: 1;
+                    }
+                    DarkButton { text: root.zh ? "MSIX..." : "MSIX..."; clicked => { root.msix-browse(); } }
+                }
+
+                CheckBox { text: root.zh ? "保留下载的安装器缓存" : "Keep downloaded installer cache"; checked <=> root.keep-downloads; }
+
+                Text {
+                    text: root.fetcher == 0 ? (root.zh ? "官方安装器会读取 winget 元数据、校验 SHA-256、运行 Anthropic 安装器，然后检查 Appx 注册。" : "Official installer reads winget metadata, verifies SHA-256, runs Anthropic's installer, then checks Appx registration.") : root.fetcher == 1 ? (root.zh ? "本地 MSIX 会通过 Add-AppxPackage 安装，并在需要时修复注册。" : "Local MSIX installs through Add-AppxPackage and then repairs registration if needed.") : (root.zh ? "解包诊断只会展开 MSIX 用于检查，不会成为正式注册的 Claude 安装。" : "Extract diagnostic unpacks the MSIX for inspection only; it does not become the registered Claude install.");
+                    color: #83786a;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+            }
+
+            // Progress
+            if root.current-screen == 4 : VerticalBox {
+                spacing: 14px;
+                Rectangle { vertical-stretch: 1; } // top spacer
+                BrandMark {
+                    phase: root.motion-tick;
+                    width: 74px;
+                    height: 74px;
+                }
+                Text {
+                    text: root.progress-phase;
+                    color: #1d1a16;
+                    font-size: 15px;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                }
+                MotionBar {
+                    indeterminate: root.progress-indeterminate;
+                    value: root.progress-fraction;
+                    phase: root.motion-tick;
+                    accent: #c86f52;
+                }
+                Text {
+                    text: root.progress-detail;
+                    color: #6d6358;
+                    font-size: 12px;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+                Rectangle { vertical-stretch: 1; } // bottom spacer
+            }
+
+            // Done
+            if root.current-screen == 5 : VerticalBox {
+                spacing: 10px;
+                Rectangle { vertical-stretch: 1; }
+                Text {
+                    text: root.zh ? "Claude Desktop Updater 已安装。" : "Claude Desktop Updater is installed.";
+                    color: #25845f;
+                    font-size: 18px;
+                    font-weight: 700;
+                    horizontal-alignment: center;
+                }
+                Text {
+                    text: (root.zh ? "版本 " : "Version ") + root.installed-version;
+                    color: #1d1a16;
+                    font-size: 13px;
+                    horizontal-alignment: center;
+                }
+                Text {
+                    text: root.install-path;
+                    color: #83786a;
+                    font-size: 11px;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+                Rectangle { vertical-stretch: 1; }
+            }
+
+            // Error
+            if root.current-screen == 6 : VerticalBox {
+                spacing: 10px;
+                Text {
+                    text: root.zh ? "安装失败" : "Installation failed";
+                    color: #a7433f;
+                    font-size: 16px;
+                    font-weight: 700;
+                }
+                Text {
+                    text: root.error-text;
+                    color: #1d1a16;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+            }
+
+            // Proxy status
+            if root.current-screen == 10 : VerticalBox {
+                spacing: 10px;
+                Text { text: root.zh ? "启动模式" : "Proxy mode"; color: #c86f52; font-size: 14px; font-weight: 600; }
+                Text { text: root.proxy-status; color: #6d6358; font-size: 12px; wrap: word-wrap; }
+            }
+
+            // Checking for updates
+            if root.current-screen == 11 : VerticalBox {
+                spacing: 12px;
+                Rectangle { vertical-stretch: 1; }
+                BrandMark {
+                    phase: root.motion-tick;
+                    width: 74px;
+                    height: 74px;
+                }
+                Text {
+                    text: root.zh ? "正在检查更新..." : "Checking for updates...";
+                    color: #1d1a16;
+                    font-size: 15px;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                }
+                MotionBar {
+                    indeterminate: true;
+                    value: 0.0;
+                    phase: root.motion-tick;
+                    accent: #c86f52;
+                }
+                Text {
+                    text: root.zh ? "正在联系 winget 更新源..." : "Contacting the winget source...";
+                    color: #6d6358;
+                    font-size: 12px;
+                    horizontal-alignment: center;
+                }
+                Rectangle { vertical-stretch: 1; }
+            }
+
+            // Update available
+            if root.current-screen == 12 : VerticalBox {
+                spacing: 10px;
+                Text {
+                    text: root.zh ? "Claude 有新版本可用。" : "A new version of Claude is available.";
+                    color: #1d1a16;
+                    font-size: 15px;
+                    font-weight: 600;
+                }
+                VersionPair {
+                    left-label: root.zh ? "已安装" : "Installed";
+                    left-value: root.update-current-version;
+                    right-label: root.zh ? "最新版本" : "Latest";
+                    right-value: root.update-latest-version;
+                }
+                Rectangle { height: 1px; background: #e2d8c9; }
+                Text { text: root.zh ? "暂时不更新？" : "Don't update now?"; color: #83786a; font-size: 11px; }
+                HorizontalBox {
+                    padding: 0px;
+                    spacing: 6px;
+                    DarkButton { text: root.zh ? "下次提醒" : "Remind next time"; clicked => { root.request-update(1); } }
+                    DarkButton { text: root.zh ? "推迟 1 天" : "Snooze 1 day"; clicked => { root.request-update(3); } }
+                    DarkButton { text: root.zh ? "推迟 7 天" : "Snooze 7 days"; clicked => { root.request-update(4); } }
+                }
+                HorizontalBox {
+                    padding: 0px;
+                    spacing: 6px;
+                    DarkButton { text: root.zh ? "跳过此版本" : "Skip this version"; clicked => { root.request-update(2); } }
+                    DarkButton { text: root.zh ? "不再检查" : "Never check again"; clicked => { root.request-update(5); } }
+                }
+            }
+
+            // Up to date
+            if root.current-screen == 13 : VerticalBox {
+                spacing: 10px;
+                Text {
+                    text: root.zh ? "Claude 已是最新版本。" : "Claude is up to date.";
+                    color: #25845f;
+                    font-size: 16px;
+                    font-weight: 700;
+                }
+                Text {
+                    text: root.zh ? "已经完成更新检查。你可以现在启动 Claude，或先关闭此窗口。" : "The update check is complete. You can launch Claude now or close this window.";
+                    color: #6d6358;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+                VersionPair {
+                    left-label: root.zh ? "已安装" : "Installed";
+                    left-value: root.update-current-version;
+                    right-label: root.zh ? "最新版本" : "Latest";
+                    right-value: root.update-latest-version;
+                }
+                Rectangle { height: 1px; background: #e2d8c9; }
+                Rectangle { vertical-stretch: 1; }
+            }
+
+            // Uninstall: confirm
+            if root.current-screen == 20 : VerticalBox {
+                spacing: 12px;
+                Text {
+                    text: root.zh ? "卸载 Claude Desktop Updater？" : "Uninstall Claude Desktop Updater?";
+                    color: #1d1a16;
+                    font-size: 16px;
+                    font-weight: 700;
+                }
+                Text {
+                    text: root.zh ? "这会移除更新器启动器和开始菜单快捷方式，不会卸载 Anthropic Claude。" : "This will remove the updater launcher and Start Menu shortcut. Anthropic Claude will not be uninstalled.";
+                    color: #6d6358;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: root.zh ? "你的 Claude 应用、日志和登录数据不会被删除。" : "Your Claude app, logs, and sign-in data will NOT be deleted.";
+                    color: #c86f52;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+                Rectangle { vertical-stretch: 1; }
+            }
+
+            // Uninstall: progress (reuses the same progress-* properties as screen 4)
+            if root.current-screen == 21 : VerticalBox {
+                spacing: 14px;
+                Rectangle { vertical-stretch: 1; }
+                Text {
+                    text: root.progress-phase;
+                    color: #1d1a16;
+                    font-size: 15px;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                }
+                MotionBar {
+                    indeterminate: root.progress-indeterminate;
+                    value: root.progress-fraction;
+                    phase: root.motion-tick;
+                    accent: #a7433f;
+                }
+                Text {
+                    text: root.progress-detail;
+                    color: #6d6358;
+                    font-size: 12px;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+                Rectangle { vertical-stretch: 1; }
+            }
+
+            // Uninstall: complete
+            if root.current-screen == 22 : VerticalBox {
+                spacing: 10px;
+                Rectangle { vertical-stretch: 1; }
+                Text {
+                    text: root.zh ? "Claude Desktop Updater 已卸载。" : "Claude Desktop Updater has been uninstalled.";
+                    color: #25845f;
+                    font-size: 16px;
+                    font-weight: 700;
+                    horizontal-alignment: center;
+                }
+                Text {
+                    text: root.uninstall-log-path == "" ? "" : (root.zh ? "日志：" : "Log: ") + root.uninstall-log-path;
+                    color: #83786a;
+                    font-size: 10px;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+                Rectangle { vertical-stretch: 1; }
+            }
+
+            // Uninstall: error / refused
+            if root.current-screen == 23 : VerticalBox {
+                spacing: 10px;
+                Text {
+                    text: root.zh ? "卸载失败" : "Uninstall failed";
+                    color: #a7433f;
+                    font-size: 16px;
+                    font-weight: 700;
+                }
+                Text {
+                    text: root.error-text;
+                    color: #1d1a16;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+            }
+
+            // Launcher self-update prompt (screen 30) — informational, doesn't gate Claude.
+            if root.current-screen == 30 : VerticalBox {
+                spacing: 10px;
+                Text {
+                    text: root.zh ? "启动器有新版本可用。" : "A new version of this launcher is available.";
+                    color: #1d1a16;
+                    font-size: 15px;
+                    font-weight: 600;
+                }
+                HorizontalBox {
+                    padding: 0px;
+                    spacing: 16px;
+                    VerticalBox {
+                        spacing: 2px;
+                        padding: 0px;
+                        Text { text: root.zh ? "已安装" : "Installed"; color: #83786a; font-size: 11px; }
+                        Text {
+                            text: root.launcher-current-version;
+                            color: #1d1a16;
+                            font-size: 14px;
+                        }
+                    }
+                    VerticalBox {
+                        spacing: 2px;
+                        padding: 0px;
+                        Text { text: root.zh ? "最新版本" : "Latest"; color: #83786a; font-size: 11px; }
+                        Text {
+                            text: root.launcher-latest-version;
+                            color: #c86f52;
+                            font-size: 14px;
+                            font-weight: 600;
+                        }
+                    }
+                    Rectangle {}
+                }
+                Rectangle { height: 1px; background: #e2d8c9; }
+                // Primary action row: update + view release notes.
+                HorizontalBox {
+                    padding: 0px;
+                    spacing: 6px;
+                    DarkButton {
+                        text: root.zh ? "更新启动器" : "Update launcher";
+                        primary: true;
+                        clicked => { root.request-launcher-action(6); }
+                    }
+                    DarkButton {
+                        text: root.zh ? "发行说明" : "Release notes";
+                        clicked => { root.request-launcher-action(0); }
+                    }
+                    Rectangle {} // spacer pushes primary actions to the left
+                }
+                Rectangle { height: 4px; }
+                // Defer row(s): muted, secondary group.
+                Text { text: root.zh ? "或稍后处理" : "Or defer"; color: #83786a; font-size: 11px; }
+                HorizontalBox {
+                    padding: 0px;
+                    spacing: 6px;
+                    DarkButton { text: root.zh ? "下次提醒" : "Remind next time";  clicked => { root.request-launcher-action(1); } }
+                    DarkButton { text: root.zh ? "推迟 1 天" : "Snooze 1 day";       clicked => { root.request-launcher-action(3); } }
+                    DarkButton { text: root.zh ? "推迟 7 天" : "Snooze 7 days";      clicked => { root.request-launcher-action(4); } }
+                }
+                HorizontalBox {
+                    padding: 0px;
+                    spacing: 6px;
+                    DarkButton { text: root.zh ? "跳过此版本" : "Skip this version";  clicked => { root.request-launcher-action(2); } }
+                    DarkButton { text: root.zh ? "不再提醒" : "Never";              clicked => { root.request-launcher-action(5); } }
+                }
+            }
+
+            // Launcher self-update succeeded (screen 31).
+            if root.current-screen == 31 : VerticalBox {
+                spacing: 10px;
+                Rectangle { vertical-stretch: 1; }
+                Text {
+                    text: root.zh ? "启动器已更新。" : "Launcher updated.";
+                    color: #25845f;
+                    font-size: 18px;
+                    font-weight: 700;
+                    horizontal-alignment: center;
+                }
+                Text {
+                    text: (root.zh ? "版本 " : "Version ") + root.launcher-latest-version;
+                    color: #1d1a16;
+                    font-size: 13px;
+                    horizontal-alignment: center;
+                }
+                Text {
+                    text: root.zh ? "关闭此窗口即可完成。下次启动 Claude Desktop Updater 时会使用新启动器。" : "Close this window to finish. The new launcher will be used the next time you start Claude Desktop Updater.";
+                    color: #6d6358;
+                    font-size: 12px;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+                Rectangle { vertical-stretch: 1; }
+            }
+        }
+
+        // Footer nav
+        HorizontalBox {
+            padding: 0px;
+            spacing: 8px;
+            // Back
+            if root.current-screen >= 1 && root.current-screen <= 3 : DarkButton {
+                text: root.zh ? "上一步" : "Back";
+                clicked => { root.current-screen = root.current-screen - 1; }
+            }
+            Rectangle {} // spacer
+
+            if root.current-screen == 0 : DarkButton {
+                text: root.zh ? "取消" : "Cancel";
+                clicked => { root.request-quit(); }
+            }
+            if root.current-screen <= 3 && root.current-screen != 0 : DarkButton {
+                text: root.zh ? "取消" : "Cancel";
+                clicked => { root.request-quit(); }
+            }
+            if root.current-screen == 0 : DarkButton {
+                text: root.zh ? "下一步" : "Next";
+                primary: true;
+                clicked => { root.current-screen = 1; }
+            }
+            if root.current-screen == 1 : DarkButton {
+                text: root.zh ? "下一步" : "Next";
+                primary: true;
+                clicked => { root.current-screen = 2; }
+            }
+            if root.current-screen == 2 : DarkButton {
+                text: root.zh ? "下一步" : "Next";
+                primary: true;
+                disabled: root.install-path == "";
+                clicked => { root.current-screen = 3; }
+            }
+            if root.current-screen == 3 : DarkButton {
+                text: root.zh ? "安装" : "Install";
+                primary: true;
+                clicked => { root.current-screen = 4; root.request-install(); }
+            }
+            if root.current-screen == 5 : DarkButton {
+                text: root.zh ? "启动 Claude" : "Launch Claude";
+                primary: true;
+                clicked => { root.request-launch(); }
+            }
+            if root.current-screen == 5 : DarkButton {
+                text: root.zh ? "关闭" : "Close";
+                clicked => { root.request-quit(); }
+            }
+            if root.current-screen == 6 : DarkButton {
+                text: root.zh ? "关闭" : "Close";
+                clicked => { root.request-quit(); }
+            }
+            if root.current-screen == 10 : DarkButton {
+                text: root.zh ? "检查更新" : "Check for updates";
+                clicked => { root.request-check-updates(); }
+            }
+            if root.current-screen == 10 : DarkButton {
+                text: root.zh ? "关闭" : "Close";
+                clicked => { root.request-quit(); }
+            }
+            if root.current-screen == 12 : DarkButton {
+                text: root.zh ? "立即更新" : "Update now";
+                primary: true;
+                clicked => { root.request-update(0); }
+            }
+            if root.current-screen == 13 : DarkButton {
+                text: root.zh ? "启动 Claude" : "Launch Claude";
+                primary: true;
+                clicked => { root.request-launch(); }
+            }
+            if root.current-screen == 13 : DarkButton {
+                text: root.zh ? "关闭" : "Close";
+                clicked => { root.request-quit(); }
+            }
+            // Uninstall confirm
+            if root.current-screen == 20 : DarkButton {
+                text: root.zh ? "取消" : "Cancel";
+                clicked => { root.request-quit(); }
+            }
+            if root.current-screen == 20 : DarkButton {
+                text: root.zh ? "卸载" : "Uninstall";
+                primary: true;
+                clicked => { root.current-screen = 21; root.request-uninstall-start(); }
+            }
+            // Uninstall complete / error
+            if root.current-screen == 22 : DarkButton {
+                text: root.zh ? "关闭" : "Close";
+                primary: true;
+                clicked => { root.request-quit(); }
+            }
+            if root.current-screen == 23 : DarkButton {
+                text: root.zh ? "关闭" : "Close";
+                clicked => { root.request-quit(); }
+            }
+            // Launcher self-update done
+            if root.current-screen == 31 : DarkButton {
+                text: root.zh ? "关闭" : "Close";
+                primary: true;
+                clicked => { root.request-quit(); }
+            }
+        }
+
+        // Slint Royalty-Free 2.0 attribution. Required to be visible during
+        // normal use of the application. Placed in the window chrome so it
+        // shows on every screen (installer, proxy splash, uninstall).
+        Text {
+            text: root.zh ? "使用 Slint 构建" : "Made with Slint";
+            color: #9d9488;
+            font-size: 10px;
+            horizontal-alignment: right;
+        }
+    }
+}
