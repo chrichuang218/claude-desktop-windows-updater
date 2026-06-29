@@ -3,7 +3,7 @@ use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 use std::cmp::Ordering;
 use std::ffi::OsStr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[cfg(windows)]
@@ -17,13 +17,14 @@ pub const CLAUDE_STARTUP_TASK: &str = "ClaudeStartup";
 pub const CLAUDE_SERVICE_NAME: &str = "CoworkVMService";
 pub const CLAUDE_EXE: &str = r"app\Claude.exe";
 pub const CLAUDE_COWORK_EXE: &str = r"app\resources\cowork-svc.exe";
-pub const CLAUDE_WINGET_ID: &str = "Anthropic.Claude";
+pub const CLAUDE_MSIX_LATEST_X64_URL: &str =
+    "https://claude.ai/api/desktop/win32/x64/msix/latest/redirect";
+pub const CLAUDE_LOCAL_PACKAGE_FAMILY: &str = "AnthropicClaude";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WingetInstallerMetadata {
+pub struct OfficialMsixMetadata {
     pub version: String,
-    pub installer_url: String,
-    pub sha256: String,
+    pub msix_url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +34,7 @@ pub struct ClaudePackageStatus {
     pub version: String,
     pub architecture: String,
     pub install_location: String,
+    pub signature_kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -54,23 +56,6 @@ impl ClaudeManifestIntegrations {
     }
 }
 
-pub fn parse_winget_show(output: &str) -> Result<WingetInstallerMetadata> {
-    let version = find_value(output, &["版本"]).ok_or_else(|| anyhow!("missing version"))?;
-    let installer_url = find_value(output, &["Installer Url", "Installer URL", "安装程序 URL"])
-        .ok_or_else(|| anyhow!("missing installer url"))?;
-    let sha256 = find_value(
-        output,
-        &["Installer Sha256", "Installer SHA256", "安装程序 SHA256"],
-    )
-    .ok_or_else(|| anyhow!("missing installer sha256"))?;
-
-    Ok(WingetInstallerMetadata {
-        version,
-        installer_url,
-        sha256,
-    })
-}
-
 pub fn parse_appx_package(output: &str) -> Result<ClaudePackageStatus> {
     let package_full_name = find_value(output, &["PackageFullName"])
         .ok_or_else(|| anyhow!("missing PackageFullName"))?;
@@ -81,6 +66,7 @@ pub fn parse_appx_package(output: &str) -> Result<ClaudePackageStatus> {
         find_value(output, &["Architecture"]).ok_or_else(|| anyhow!("missing Architecture"))?;
     let install_location = find_value(output, &["InstallLocation"])
         .ok_or_else(|| anyhow!("missing InstallLocation"))?;
+    let signature_kind = find_value(output, &["SignatureKind"]);
 
     Ok(ClaudePackageStatus {
         package_full_name,
@@ -88,6 +74,7 @@ pub fn parse_appx_package(output: &str) -> Result<ClaudePackageStatus> {
         version,
         architecture,
         install_location,
+        signature_kind,
     })
 }
 
@@ -240,9 +227,16 @@ pub fn msix_install_command(msix: &Path) -> String {
     )
 }
 
+pub fn remove_package_command(status: &ClaudePackageStatus) -> String {
+    format!(
+        "$ErrorActionPreference = 'Stop'; Remove-AppxPackage -Package '{}' -ErrorAction Stop",
+        escape_powershell_single_quoted(&status.package_full_name)
+    )
+}
+
 pub fn query_package_status() -> Result<ClaudePackageStatus> {
     let command = format!(
-        "Get-AppxPackage -Name {} | Select-Object Name, PackageFullName, PackageFamilyName, Version, Architecture, InstallLocation | Format-List",
+        "Get-AppxPackage -Name {} | Select-Object Name, PackageFullName, PackageFamilyName, Version, Architecture, InstallLocation, SignatureKind | Format-List",
         CLAUDE_PACKAGE_NAME
     );
     let output = windows_powershell()
@@ -259,19 +253,94 @@ pub fn query_package_status() -> Result<ClaudePackageStatus> {
     parse_appx_package(&String::from_utf8_lossy(&output.stdout))
 }
 
-pub fn query_winget_metadata() -> Result<WingetInstallerMetadata> {
-    let output = command_no_window("winget")
-        .args(["show", "--id", CLAUDE_WINGET_ID, "--source", "winget"])
-        .output()
-        .context("running winget show")?;
+pub fn parse_msix_version_from_url(url: &str) -> Result<String> {
+    let marker = "/releases/win32/x64/";
+    let Some((_, tail)) = url.split_once(marker) else {
+        anyhow::bail!("MSIX URL does not contain {marker}: {url}");
+    };
+    let version = tail
+        .split('/')
+        .next()
+        .filter(|part| !part.trim().is_empty())
+        .ok_or_else(|| anyhow!("MSIX URL is missing version: {url}"))?;
+    Ok(version.to_string())
+}
 
-    if !output.status.success() {
-        return Err(anyhow!(
-            "winget show failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
+pub fn query_local_install_status() -> Result<ClaudePackageStatus> {
+    let root = local_install_root()?;
+    let mut best: Option<(String, PathBuf)> = None;
+    for entry in std::fs::read_dir(&root).with_context(|| format!("reading {}", root.display()))? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(version) = name.strip_prefix("app-").map(str::to_string) else {
+            continue;
+        };
+        let app_dir = entry.path();
+        if !app_dir.join("claude.exe").is_file() {
+            continue;
+        }
+        let is_newer = best
+            .as_ref()
+            .map(|(current, _)| compare_versions(&version, current) == Ordering::Greater)
+            .unwrap_or(true);
+        if is_newer {
+            best = Some((version, app_dir));
+        }
     }
-    parse_winget_show(&String::from_utf8_lossy(&output.stdout))
+
+    let (version, app_dir) = best.ok_or_else(|| {
+        anyhow!(
+            "no local AnthropicClaude app-* install found under {}",
+            root.display()
+        )
+    })?;
+
+    Ok(ClaudePackageStatus {
+        package_full_name: format!("AnthropicClaude_{}_x64", version),
+        package_family_name: CLAUDE_LOCAL_PACKAGE_FAMILY.into(),
+        version,
+        architecture: "X64".into(),
+        install_location: app_dir.to_string_lossy().into_owned(),
+        signature_kind: None,
+    })
+}
+
+pub fn query_best_package_status() -> Result<ClaudePackageStatus> {
+    match (query_package_status().ok(), query_local_install_status().ok()) {
+        (Some(appx), Some(local)) => {
+            if compare_versions(&local.version, &appx.version) == Ordering::Greater {
+                Ok(local)
+            } else {
+                Ok(appx)
+            }
+        }
+        (Some(appx), None) => Ok(appx),
+        (None, Some(local)) => Ok(local),
+        (None, None) => anyhow::bail!("Claude is not installed as Appx or local AnthropicClaude"),
+    }
+}
+
+pub fn package_is_appx(status: &ClaudePackageStatus) -> bool {
+    status.package_family_name == CLAUDE_PACKAGE_FAMILY
+}
+
+pub fn package_is_developer_signed(status: &ClaudePackageStatus) -> bool {
+    status
+        .signature_kind
+        .as_deref()
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("Developer"))
+}
+
+pub fn claude_exe_path(status: &ClaudePackageStatus) -> PathBuf {
+    let root = PathBuf::from(&status.install_location);
+    if package_is_appx(status) {
+        root.join("app").join("Claude.exe")
+    } else {
+        root.join("claude.exe")
+    }
 }
 
 pub fn query_start_apps_registered() -> Result<bool> {
@@ -341,11 +410,95 @@ pub fn run_powershell(command: &str) -> Result<()> {
 }
 
 pub fn launch_registered_claude() -> Result<()> {
+    if let Ok(status) = query_best_package_status() {
+        if !package_is_appx(&status) {
+            let exe = claude_exe_path(&status);
+            command_no_window(&exe)
+                .spawn()
+                .with_context(|| format!("launching Claude at {}", exe.display()))?;
+            return Ok(());
+        }
+    }
+
     command_no_window("explorer.exe")
         .arg(format!(r"shell:appsFolder\{CLAUDE_APP_ID}"))
         .spawn()
         .context("launching Claude via shell:appsFolder")?;
     Ok(())
+}
+
+pub fn query_official_msix_metadata() -> Result<OfficialMsixMetadata> {
+    let client = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(60))
+        .build()?;
+    let response = client.get(CLAUDE_MSIX_LATEST_X64_URL).send()?;
+    if !response.status().is_redirection() {
+        anyhow::bail!(
+            "official Claude MSIX redirect returned HTTP {}",
+            response.status()
+        );
+    }
+    let location = response
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .ok_or_else(|| anyhow!("official Claude MSIX redirect is missing Location"))?
+        .to_str()
+        .context("decoding official Claude MSIX redirect Location")?;
+    let msix_url = if location.starts_with("https://") {
+        location.to_string()
+    } else if location.starts_with('/') {
+        format!("https://downloads.claude.ai{location}")
+    } else {
+        anyhow::bail!("unsupported official Claude MSIX redirect Location: {location}");
+    };
+    let version = parse_msix_version_from_url(&msix_url)?;
+    Ok(OfficialMsixMetadata { version, msix_url })
+}
+
+pub fn stop_running_claude() -> Result<()> {
+    run_powershell(stop_running_claude_command())
+}
+
+fn stop_running_claude_command() -> &'static str {
+    r#"
+$local = Join-Path $env:LOCALAPPDATA 'AnthropicClaude'
+function Is-OfficialClaudeProcess($process) {
+    $path = $null
+    try { $path = $process.Path } catch { return $false }
+    if ([string]::IsNullOrWhiteSpace($path)) { return $false }
+    return $path -like '*\WindowsApps\Claude_*__pzs8sxrjxfjjc\app\Claude.exe' -or $path -like "$local\*"
+}
+
+try {
+    $service = Get-Service -Name 'CoworkVMService' -ErrorAction SilentlyContinue
+    if ($null -ne $service -and $service.Status -ne 'Stopped') {
+        Stop-Service -Name 'CoworkVMService' -Force -ErrorAction Stop
+        $service.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(15))
+    }
+} catch {
+    Write-Error ("Failed to stop CoworkVMService: {0}" -f $_.Exception.Message)
+    exit 1
+}
+
+$targets = @(Get-Process -Name claude -ErrorAction SilentlyContinue | Where-Object { Is-OfficialClaudeProcess $_ })
+foreach ($process in $targets) {
+    try { Stop-Process -Id $process.Id -Force -ErrorAction Stop } catch {}
+}
+Start-Sleep -Milliseconds 500
+$service = Get-Service -Name 'CoworkVMService' -ErrorAction SilentlyContinue
+if ($null -ne $service -and $service.Status -ne 'Stopped') {
+    Write-Error "Failed to stop CoworkVMService"
+    exit 1
+}
+$still = @(Get-Process -Name claude -ErrorAction SilentlyContinue | Where-Object { Is-OfficialClaudeProcess $_ })
+if ($still.Count -gt 0) {
+    Write-Error ("Failed to stop {0} Claude process(es)" -f $still.Count)
+    exit 1
+}
+exit 0
+"#
 }
 
 fn windows_powershell() -> Command {
@@ -354,6 +507,12 @@ fn windows_powershell() -> Command {
         r"{}\System32\WindowsPowerShell\v1.0\powershell.exe",
         system_root
     ))
+}
+
+fn local_install_root() -> Result<PathBuf> {
+    let local_app_data = std::env::var_os("LOCALAPPDATA")
+        .ok_or_else(|| anyhow!("LOCALAPPDATA is not set"))?;
+    Ok(PathBuf::from(local_app_data).join(CLAUDE_LOCAL_PACKAGE_FAMILY))
 }
 
 fn command_no_window(program: impl AsRef<OsStr>) -> Command {
@@ -402,27 +561,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_winget_show_output_for_installer_metadata() {
-        let output = r#"
-已找到 Claude [Anthropic.Claude]
-版本: 1.15962.1
-安装：
-  安装程序类型： exe
-  安装程序 URL： https://downloads.claude.ai/releases/win32/x64/1.15962.1/Claude.exe
-  安装程序 SHA256： 9e17f7dc732595b59cc07cbfec9bc3bc826355cafdbbed12475eb6f084dd6d16
-"#;
+    fn parses_official_msix_version_from_redirect_url() {
+        let version = parse_msix_version_from_url(
+            "https://downloads.claude.ai/releases/win32/x64/1.15962.1/Claude-1e236d9fa9efd21a5a0a66a7b70c028f48848604.msix",
+        )
+        .expect("msix version");
 
-        let metadata = parse_winget_show(output).expect("winget metadata");
-
-        assert_eq!(metadata.version, "1.15962.1");
-        assert_eq!(
-            metadata.installer_url,
-            "https://downloads.claude.ai/releases/win32/x64/1.15962.1/Claude.exe"
-        );
-        assert_eq!(
-            metadata.sha256,
-            "9e17f7dc732595b59cc07cbfec9bc3bc826355cafdbbed12475eb6f084dd6d16"
-        );
+        assert_eq!(version, "1.15962.1");
     }
 
     #[test]
@@ -434,6 +579,7 @@ PackageFamilyName : Claude_pzs8sxrjxfjjc
 Version           : 1.15962.1.0
 Architecture      : X64
 InstallLocation   : C:\Program Files\WindowsApps\Claude_1.15962.1.0_x64__pzs8sxrjxfjjc
+SignatureKind     : Developer
 "#;
 
         let status = parse_appx_package(output).expect("appx status");
@@ -448,6 +594,8 @@ InstallLocation   : C:\Program Files\WindowsApps\Claude_1.15962.1.0_x64__pzs8sxr
         assert!(status
             .install_location
             .ends_with("Claude_1.15962.1.0_x64__pzs8sxrjxfjjc"));
+        assert_eq!(status.signature_kind.as_deref(), Some("Developer"));
+        assert!(package_is_developer_signed(&status));
     }
 
     #[test]
@@ -498,6 +646,10 @@ Claude         Claude_pzs8sxrjxfjjc!Claude
             std::cmp::Ordering::Equal
         );
         assert_eq!(
+            compare_versions("1.15962.1", "1.9659.2.0"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
             compare_versions("1.15963.0", "1.15962.9"),
             std::cmp::Ordering::Greater
         );
@@ -514,6 +666,23 @@ Claude         Claude_pzs8sxrjxfjjc!Claude
         assert_eq!(display_version("1.2.0.0"), "1.2.0");
         assert_eq!(display_version("1.15962.1"), "1.15962.1");
         assert_eq!(display_version("1.15962.1-beta"), "1.15962.1-beta");
+    }
+
+    #[test]
+    fn local_install_uses_root_claude_exe() {
+        let status = ClaudePackageStatus {
+            package_full_name: "AnthropicClaude_1.15962.1_x64".into(),
+            package_family_name: CLAUDE_LOCAL_PACKAGE_FAMILY.into(),
+            version: "1.15962.1".into(),
+            architecture: "X64".into(),
+            install_location: r"C:\Users\me\AppData\Local\AnthropicClaude\app-1.15962.1".into(),
+            signature_kind: None,
+        };
+
+        assert_eq!(
+            claude_exe_path(&status),
+            PathBuf::from(r"C:\Users\me\AppData\Local\AnthropicClaude\app-1.15962.1\claude.exe")
+        );
     }
 
     #[test]
@@ -544,6 +713,16 @@ Claude         Claude_pzs8sxrjxfjjc!Claude
     }
 
     #[test]
+    fn stop_running_claude_script_treats_no_process_as_success() {
+        let command = stop_running_claude_command();
+        assert!(command.contains("CoworkVMService"));
+        assert!(command.contains("Stop-Service"));
+        assert!(command.contains("exit 0"));
+        assert!(command.contains("exit 1"));
+        assert!(command.contains("Get-Process -Name claude"));
+    }
+
+    #[test]
     fn builds_register_command_for_existing_manifest() {
         let status = ClaudePackageStatus {
             package_full_name: "Claude_1.15962.1.0_x64__pzs8sxrjxfjjc".into(),
@@ -552,6 +731,7 @@ Claude         Claude_pzs8sxrjxfjjc!Claude
             architecture: "X64".into(),
             install_location: r"C:\Program Files\WindowsApps\Claude_1.15962.1.0_x64__pzs8sxrjxfjjc"
                 .into(),
+            signature_kind: Some("Developer".into()),
         };
 
         let command = register_manifest_command(&status);
@@ -569,5 +749,22 @@ Claude         Claude_pzs8sxrjxfjjc!Claude
         assert!(command.contains("Add-AppxPackage"));
         assert!(command.contains("-ForceUpdateFromAnyVersion"));
         assert!(command.contains(r"D:\Downloads\Claude.msix"));
+    }
+
+    #[test]
+    fn builds_remove_package_command_for_developer_registration() {
+        let status = ClaudePackageStatus {
+            package_full_name: "Claude_1.9659.2.0_x64__pzs8sxrjxfjjc".into(),
+            package_family_name: CLAUDE_PACKAGE_FAMILY.into(),
+            version: "1.9659.2.0".into(),
+            architecture: "X64".into(),
+            install_location: r"C:\Program Files\WindowsApps\Claude_1.9659.2.0_x64__pzs8sxrjxfjjc"
+                .into(),
+            signature_kind: Some("Developer".into()),
+        };
+        let command = remove_package_command(&status);
+
+        assert!(command.contains("Remove-AppxPackage"));
+        assert!(command.contains("Claude_1.9659.2.0_x64__pzs8sxrjxfjjc"));
     }
 }

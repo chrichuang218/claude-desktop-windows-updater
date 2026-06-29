@@ -18,12 +18,11 @@ use config::{
     AppLanguage, Config, Fetcher, InstallMode, UpdatePolicy, APP_DATA_DIR_NAME, CONFIG_FILENAME,
     LEGACY_UPDATER_EXE_NAME, UPDATER_EXE_NAME,
 };
-use sha2::{Digest, Sha256};
+use anyhow::Context;
 use slint::ComponentHandle;
 use std::cmp::Ordering;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
 slint::include_modules!();
@@ -56,7 +55,21 @@ struct InstalledUpdateContext {
     root: PathBuf,
     cfg: Config,
     status: claude::ClaudePackageStatus,
-    latest: claude::WingetInstallerMetadata,
+    latest: claude::OfficialMsixMetadata,
+}
+
+fn finish_ui_session(ui_weak: &slint::Weak<AppWindow>) {
+    if let Some(ui) = ui_weak.upgrade() {
+        let _ = ui.window().hide();
+    }
+    let _ = slint::quit_event_loop();
+
+    // Some final screens are reached after elevation and background worker hops.
+    // If Slint does not tear down promptly, make Close/Launch deterministic.
+    std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_millis(250));
+        std::process::exit(0);
+    });
 }
 
 fn run_installed_mode() -> anyhow::Result<()> {
@@ -67,7 +80,7 @@ fn run_installed_mode() -> anyhow::Result<()> {
         .to_path_buf();
     let mut cfg = Config::load(&cfg_path)?;
 
-    let current_status = match claude::query_package_status() {
+    let current_status = match claude::query_best_package_status() {
         Ok(status) => {
             sync_installed_config(&root, &mut cfg, &status, None)?;
             Some(status)
@@ -75,27 +88,27 @@ fn run_installed_mode() -> anyhow::Result<()> {
         Err(_) => None,
     };
 
-    if !update_check_due(&cfg) {
+    if current_status.is_some() && !update_check_due(&cfg) {
         if !matches!(cfg.update_policy, UpdatePolicy::Never) {
             if let (Some(status), Some(known_latest)) =
                 (current_status.as_ref(), cfg.known_latest.clone())
             {
-                let skipped = cfg.skipped_version.as_deref() == Some(known_latest.as_str());
-                let already_current =
-                    claude::compare_versions(&known_latest, &status.version) != Ordering::Greater;
-                if !skipped && already_current {
+                if let Some(current_screen) = cached_update_screen(
+                    status,
+                    Some(&known_latest),
+                    cfg.skipped_version.as_deref(),
+                ) {
                     return show_update_prompt(
                         InstalledUpdateContext {
                             root,
                             cfg,
                             status: status.clone(),
-                            latest: claude::WingetInstallerMetadata {
+                            latest: claude::OfficialMsixMetadata {
                                 version: known_latest,
-                                installer_url: String::new(),
-                                sha256: String::new(),
+                                msix_url: String::new(),
                             },
                         },
-                        13,
+                        current_screen,
                     );
                 }
             }
@@ -105,21 +118,26 @@ fn run_installed_mode() -> anyhow::Result<()> {
 
     let status = match current_status {
         Some(status) => status,
-        None => claude::query_package_status()?,
+        None => missing_claude_status(&cfg),
     };
-    let latest = claude::query_winget_metadata()?;
-    sync_installed_config(&root, &mut cfg, &status, Some(latest.version.clone()))?;
+    let latest = claude::query_official_msix_metadata()?;
+    if claude_install_is_missing(&status) {
+        cfg.known_latest = Some(latest.version.clone());
+        cfg.last_check_unix = Some(now_unix());
+        cfg.save_install(&root)?;
+    } else {
+        sync_installed_config(&root, &mut cfg, &status, Some(latest.version.clone()))?;
+    }
 
     if cfg.skipped_version.as_deref() == Some(latest.version.as_str()) {
         return claude::launch_registered_claude();
     }
 
-    let current_screen =
-        if claude::compare_versions(&latest.version, &status.version) == Ordering::Greater {
-            12
-        } else {
-            13
-        };
+    let current_screen = if current_install_satisfies_official_msix(&status, &latest.version) {
+        13
+    } else {
+        12
+    };
 
     show_update_prompt(
         InstalledUpdateContext {
@@ -130,6 +148,38 @@ fn run_installed_mode() -> anyhow::Result<()> {
         },
         current_screen,
     )
+}
+
+fn missing_claude_status(cfg: &Config) -> claude::ClaudePackageStatus {
+    claude::ClaudePackageStatus {
+        package_full_name: "Claude_not_installed".into(),
+        package_family_name: "missing".into(),
+        version: cfg.current_package_version.clone(),
+        architecture: cfg.arch.to_ascii_uppercase(),
+        install_location: String::new(),
+        signature_kind: None,
+    }
+}
+
+fn claude_install_is_missing(status: &claude::ClaudePackageStatus) -> bool {
+    status.package_family_name == "missing"
+}
+
+fn cached_update_screen(
+    current: &claude::ClaudePackageStatus,
+    known_latest: Option<&str>,
+    skipped_version: Option<&str>,
+) -> Option<i32> {
+    let known_latest = known_latest?;
+    if skipped_version == Some(known_latest) {
+        return None;
+    }
+
+    if current_install_satisfies_official_msix(current, known_latest) {
+        Some(13)
+    } else {
+        Some(12)
+    }
 }
 
 fn show_update_prompt(ctx: InstalledUpdateContext, current_screen: i32) -> anyhow::Result<()> {
@@ -162,6 +212,9 @@ fn handle_cli(args: &[String]) -> anyhow::Result<bool> {
     if args.iter().any(|a| a == "--update") {
         return run_update_cli().map(|_| true);
     }
+    if args.iter().any(|a| a == "--auto-update") {
+        return run_auto_update_ui().map(|_| true);
+    }
     if let Some(msix) = parse_string_flag(args, "--extract-msix") {
         return run_extract_diagnostic(Path::new(&msix), &std::env::current_dir()?).map(|_| true);
     }
@@ -175,10 +228,7 @@ fn handle_cli(args: &[String]) -> anyhow::Result<bool> {
 }
 
 fn run_status() -> anyhow::Result<()> {
-    let status = claude::query_package_status()?;
-    let app_id_registered = claude::query_start_apps_registered()?;
-    let protocol_registered = claude::query_protocol_registered()?;
-    let manifest = claude::query_manifest_integrations(&status)?;
+    let status = claude::query_best_package_status()?;
 
     println!("Claude package:");
     println!("  PackageFullName   : {}", status.package_full_name);
@@ -190,24 +240,36 @@ fn run_status() -> anyhow::Result<()> {
     );
     println!("  Architecture      : {}", status.architecture);
     println!("  InstallLocation   : {}", status.install_location);
-    println!("  AppID registered  : {}", app_id_registered);
-    println!("  Protocol registered: {}", protocol_registered);
-    println!("  StartupTask declared: {}", manifest.startup_task);
-    println!("  Service declared  : {}", manifest.service);
     println!(
-        "  Firewall declared : {}",
-        manifest.claude_firewall && manifest.cowork_firewall
+        "  SignatureKind     : {}",
+        status.signature_kind.as_deref().unwrap_or("unknown")
     );
-    println!("  Launch AppID      : {}", claude::CLAUDE_APP_ID);
+    if claude::package_is_appx(&status) {
+        let app_id_registered = claude::query_start_apps_registered()?;
+        let protocol_registered = claude::query_protocol_registered()?;
+        let manifest = claude::query_manifest_integrations(&status)?;
+        println!("  Install type      : Appx");
+        println!("  AppID registered  : {}", app_id_registered);
+        println!("  Protocol registered: {}", protocol_registered);
+        println!("  StartupTask declared: {}", manifest.startup_task);
+        println!("  Service declared  : {}", manifest.service);
+        println!(
+            "  Firewall declared : {}",
+            manifest.claude_firewall && manifest.cowork_firewall
+        );
+        println!("  Launch AppID      : {}", claude::CLAUDE_APP_ID);
+    } else {
+        println!("  Install type      : Local AnthropicClaude");
+        println!("  Launch executable : {}", claude::claude_exe_path(&status).display());
+    }
     Ok(())
 }
 
 fn run_check() -> anyhow::Result<()> {
-    let metadata = claude::query_winget_metadata()?;
-    println!("Latest Claude from winget:");
+    let metadata = claude::query_official_msix_metadata()?;
+    println!("Latest Claude MSIX:");
     println!("  Version       : {}", metadata.version);
-    println!("  Installer URL : {}", metadata.installer_url);
-    println!("  SHA256        : {}", metadata.sha256);
+    println!("  MSIX URL      : {}", metadata.msix_url);
     Ok(())
 }
 
@@ -237,8 +299,13 @@ fn run_msix(msix: &Path, print: bool) -> anyhow::Result<claude::ClaudePackageSta
 }
 
 fn run_update_cli() -> anyhow::Result<()> {
-    let before = claude::query_package_status().ok();
-    let latest = claude::query_winget_metadata().ok();
+    if !elevate::is_elevated() {
+        elevate::respawn_elevated("--update")?;
+        return Ok(());
+    }
+
+    let before = claude::query_best_package_status().ok();
+    let latest = claude::query_official_msix_metadata().ok();
     let status = update_from_winget(false, true)?;
     if before
         .as_ref()
@@ -255,6 +322,41 @@ fn run_update_cli() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn run_auto_update_ui() -> anyhow::Result<()> {
+    let cfg_path = installed_config_path()?;
+    let root = cfg_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("updater.json has no parent directory"))?
+        .to_path_buf();
+    let cfg = Config::load(&cfg_path)?;
+    let status = claude::query_best_package_status().unwrap_or_else(|_| missing_claude_status(&cfg));
+    let latest = claude::query_official_msix_metadata()?;
+    let ctx = InstalledUpdateContext {
+        root,
+        cfg: cfg.clone(),
+        status,
+        latest,
+    };
+
+    dark_window::install();
+    let ui = AppWindow::new()?;
+    prepare_window(&ui);
+    ui.set_language(language_to_int(cfg.language));
+    ui.set_current_screen(4);
+    let (phase, detail) = progress_text(
+        cfg.language,
+        "Updating Claude",
+        "Downloading official installer",
+    );
+    ui.set_progress_phase(phase.into());
+    ui.set_progress_detail(detail.into());
+    ui.set_progress_indeterminate(true);
+    start_gui_update(ui.as_weak(), ctx);
+    show_when_ready(&ui);
+    slint::run_event_loop()?;
+    Ok(())
+}
+
 fn update_from_winget(
     keep_downloads: bool,
     print: bool,
@@ -267,10 +369,10 @@ fn update_from_winget_with_progress(
     print: bool,
     progress: impl Fn(&str, &str, Option<f32>),
 ) -> anyhow::Result<claude::ClaudePackageStatus> {
-    let metadata = claude::query_winget_metadata()?;
+    let metadata = claude::query_official_msix_metadata()?;
 
-    if let Ok(current) = claude::query_package_status() {
-        if claude::compare_versions(&metadata.version, &current.version) != Ordering::Greater {
+    if let Ok(current) = claude::query_best_package_status() {
+        if current_install_satisfies_official_msix(&current, &metadata.version) {
             if print {
                 println!(
                     "Claude is already current: package {} / latest {}",
@@ -278,14 +380,16 @@ fn update_from_winget_with_progress(
                 );
             }
             progress("Verifying registration", "Claude is already current", None);
-            verify_claude_registration()?;
+            if claude::package_is_appx(&current) {
+                verify_claude_registration()?;
+            }
             return Ok(current);
         }
     }
 
     let download_dir = claude_download_dir();
     std::fs::create_dir_all(&download_dir)?;
-    let installer = download_dir.join(format!("Claude-{}.exe", metadata.version));
+    let installer = download_dir.join(format!("Claude-{}.msix", metadata.version));
 
     if print {
         println!("Downloading Claude {}...", metadata.version);
@@ -295,10 +399,9 @@ fn update_from_winget_with_progress(
         &format!("Preparing official installer {}", metadata.version),
         Some(0.0),
     );
-    download_with_sha256(
-        &metadata.installer_url,
+    download_file(
+        &metadata.msix_url,
         &installer,
-        &metadata.sha256,
         |done, total| {
             progress(
                 "Downloading Claude",
@@ -311,14 +414,19 @@ fn update_from_winget_with_progress(
         println!("Running installer: {}", installer.display());
     }
     progress(
-        "Running Claude installer",
-        "Waiting for Anthropic's installer to finish",
+        "Closing Claude",
+        "Stopping running Claude processes before update",
         None,
     );
-    let status = Command::new(&installer).status()?;
-    if !status.success() {
-        anyhow::bail!("Claude installer exited with status {}", status);
-    }
+    claude::stop_running_claude()?;
+    prepare_appx_for_official_msix_update(&metadata.version, &progress)?;
+    progress(
+        "Running Claude installer",
+        "Installing official MSIX package",
+        None,
+    );
+    claude::run_powershell(&claude::msix_install_command(&installer))?;
+    claude::stop_running_claude()?;
     if !keep_downloads {
         let _ = std::fs::remove_file(&installer);
     }
@@ -327,8 +435,87 @@ fn update_from_winget_with_progress(
         "Checking Windows Appx registration",
         None,
     );
-    verify_claude_registration()?;
-    claude::query_package_status()
+    let status = wait_for_installed_version(&metadata.version)?;
+    if claude::package_is_appx(&status) {
+        verify_claude_registration()?;
+    } else {
+        anyhow::bail!(
+            "Claude MSIX installed, but Windows is still launching a non-Appx install at {}",
+            status.install_location
+        );
+    }
+    Ok(status)
+}
+
+fn prepare_appx_for_official_msix_update(
+    latest_version: &str,
+    progress: &impl Fn(&str, &str, Option<f32>),
+) -> anyhow::Result<()> {
+    let Ok(appx) = claude::query_package_status() else {
+        return Ok(());
+    };
+    if !claude::package_is_developer_signed(&appx) {
+        return Ok(());
+    }
+    if claude::compare_versions(&appx.version, latest_version) != Ordering::Less {
+        return Ok(());
+    }
+
+    progress(
+        "Preparing Appx registration",
+        "Removing developer-registered Claude package",
+        None,
+    );
+    claude::run_powershell(&claude::remove_package_command(&appx))?;
+    for _ in 0..30 {
+        if claude::query_package_status().is_err() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    anyhow::bail!(
+        "Timed out removing developer-registered Claude package {}",
+        appx.package_full_name
+    )
+}
+
+fn current_install_satisfies_official_msix(
+    current: &claude::ClaudePackageStatus,
+    latest_version: &str,
+) -> bool {
+    claude::package_is_appx(current)
+        && claude::compare_versions(latest_version, &current.version) != Ordering::Greater
+}
+
+fn wait_for_installed_version(latest_version: &str) -> anyhow::Result<claude::ClaudePackageStatus> {
+    let mut last_status = None;
+    for _ in 0..30 {
+        if let Ok(status) = claude::query_best_package_status() {
+            if ensure_installed_version(&status.version, latest_version).is_ok() {
+                return Ok(status);
+            }
+            last_status = Some(status);
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+
+    let installed = last_status
+        .as_ref()
+        .map(|status| status.version.as_str())
+        .unwrap_or("unknown");
+    ensure_installed_version(installed, latest_version)?;
+    unreachable!()
+}
+
+fn ensure_installed_version(installed_version: &str, latest_version: &str) -> anyhow::Result<()> {
+    if claude::compare_versions(latest_version, installed_version) == Ordering::Greater {
+        anyhow::bail!(
+            "Claude installer finished, but Claude is still on package {} instead of latest {}",
+            installed_version,
+            latest_version
+        );
+    }
+    Ok(())
 }
 
 fn run_extract_diagnostic(msix: &Path, root: &Path) -> anyhow::Result<PathBuf> {
@@ -355,10 +542,7 @@ fn wire_update_ui(ui: &AppWindow, ctx: InstalledUpdateContext) -> anyhow::Result
     {
         let ui_weak = ui.as_weak();
         ui.on_request_quit(move || {
-            if let Some(ui) = ui_weak.upgrade() {
-                let _ = ui.window().hide();
-            }
-            let _ = slint::quit_event_loop();
+            finish_ui_session(&ui_weak);
         });
     }
 
@@ -368,10 +552,7 @@ fn wire_update_ui(ui: &AppWindow, ctx: InstalledUpdateContext) -> anyhow::Result
             if let Err(e) = claude::launch_registered_claude() {
                 dialogs::error(&format!("Could not launch Claude.\n\n{e:#}"));
             }
-            if let Some(ui) = ui_weak.upgrade() {
-                let _ = ui.window().hide();
-            }
-            let _ = slint::quit_event_loop();
+            finish_ui_session(&ui_weak);
         });
     }
 
@@ -385,6 +566,19 @@ fn wire_update_ui(ui: &AppWindow, ctx: InstalledUpdateContext) -> anyhow::Result
             };
 
             if action == 0 {
+                if !elevate::is_elevated() {
+                    match elevate::respawn_elevated("--auto-update") {
+                        Ok(()) => {
+                            finish_ui_session(&ui_weak);
+                        }
+                        Err(e) => {
+                            ui.set_error_text(format!("Couldn't obtain admin rights: {e:#}").into());
+                            ui.set_current_screen(6);
+                        }
+                    }
+                    return;
+                }
+
                 let (phase, detail) = progress_text(
                     ctx_snapshot.cfg.language,
                     "Updating Claude",
@@ -404,8 +598,7 @@ fn wire_update_ui(ui: &AppWindow, ctx: InstalledUpdateContext) -> anyhow::Result
                 return;
             }
             let _ = claude::launch_registered_claude();
-            let _ = ui.window().hide();
-            let _ = slint::quit_event_loop();
+            finish_ui_session(&ui_weak);
         });
     }
 
@@ -432,11 +625,13 @@ fn start_gui_update(ui_weak: slint::Weak<AppWindow>, ctx: InstalledUpdateContext
         });
 
         let weak = ui_weak.clone();
+        let latest_version = ctx.latest.version.clone();
         let _ = slint::invoke_from_event_loop(move || {
             let Some(ui) = weak.upgrade() else { return };
             match result {
                 Ok(status) => {
                     ui.set_update_current_version(claude::display_version(&status.version).into());
+                    ui.set_update_latest_version(claude::display_version(&latest_version).into());
                     ui.set_current_screen(13);
                 }
                 Err(e) => {
@@ -495,11 +690,13 @@ fn sync_installed_config(
     cfg.current_package_version = status.version.clone();
     cfg.current_app_version = read_app_version(status);
     cfg.arch = status.architecture.to_ascii_lowercase();
+    cfg.fetcher = Fetcher::Winget;
     if let Some(latest) = known_latest {
         cfg.known_latest = Some(latest);
         cfg.last_check_unix = Some(now_unix());
     }
-    cfg.save_install(root)
+    cfg.save_install(root)?;
+    junction::ensure_versions_layout(root, status)
 }
 
 fn update_check_due(cfg: &Config) -> bool {
@@ -543,20 +740,15 @@ fn verify_claude_registration() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn download_with_sha256(
+fn download_file(
     url: &str,
     dest: &Path,
-    expected_sha256: &str,
     progress: impl Fn(u64, Option<u64>),
 ) -> anyhow::Result<()> {
     if dest.exists() {
-        let actual = file_sha256(dest)?;
-        if actual.eq_ignore_ascii_case(expected_sha256.trim()) {
-            let len = dest.metadata().map(|m| m.len()).ok();
-            progress(len.unwrap_or(0), len);
-            return Ok(());
-        }
-        let _ = std::fs::remove_file(dest);
+        let len = dest.metadata().map(|m| m.len()).ok();
+        progress(len.unwrap_or(0), len);
+        return Ok(());
     }
 
     let partial = dest.with_extension(format!(
@@ -578,7 +770,6 @@ fn download_with_sha256(
     let total = response.content_length();
 
     let mut file = std::fs::File::create(&partial)?;
-    let mut hasher = Sha256::new();
     let mut buf = [0u8; 128 * 1024];
     let mut downloaded = 0u64;
     progress(downloaded, total);
@@ -587,7 +778,6 @@ fn download_with_sha256(
         if read == 0 {
             break;
         }
-        hasher.update(&buf[..read]);
         file.write_all(&buf[..read])?;
         downloaded += read as u64;
         progress(downloaded, total);
@@ -598,32 +788,9 @@ fn download_with_sha256(
     file.flush()?;
     drop(file);
 
-    let actual = format!("{:x}", hasher.finalize());
-    if !actual.eq_ignore_ascii_case(expected_sha256.trim()) {
-        let _ = std::fs::remove_file(&partial);
-        anyhow::bail!(
-            "SHA256 mismatch for {}\nexpected: {}\nactual:   {}",
-            dest.display(),
-            expected_sha256,
-            actual
-        );
-    }
-    std::fs::rename(&partial, dest)?;
+    std::fs::rename(&partial, dest)
+        .with_context(|| format!("moving download into place at {}", dest.display()))?;
     Ok(())
-}
-
-fn file_sha256(path: &Path) -> anyhow::Result<String> {
-    let mut file = std::fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 128 * 1024];
-    loop {
-        let read = file.read(&mut buf)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buf[..read]);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn format_download_detail(done: u64, total: Option<u64>) -> String {
@@ -674,16 +841,6 @@ fn wire_installer_ui(ui: &AppWindow, auto: Option<GuiOptions>) -> anyhow::Result
             .into_owned()
             .into(),
     );
-    ui.set_fetcher(fetcher_to_int(
-        auto.as_ref().map(|a| a.source).unwrap_or_default(),
-    ));
-    ui.set_msix_path(
-        auto.as_ref()
-            .and_then(|a| a.msix_path.as_ref())
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default()
-            .into(),
-    );
     ui.set_create_shortcut(auto.as_ref().map(|a| a.create_shortcut).unwrap_or(true));
     ui.set_register_uninstall(auto.as_ref().map(|a| a.register_uninstall).unwrap_or(true));
     ui.set_language(language_to_int(
@@ -716,23 +873,8 @@ fn wire_installer_ui(ui: &AppWindow, auto: Option<GuiOptions>) -> anyhow::Result
 
     {
         let ui_weak = ui.as_weak();
-        ui.on_msix_browse(move || {
-            let Some(ui) = ui_weak.upgrade() else { return };
-            match path_dialog::pick_file() {
-                Ok(Some(path)) => ui.set_msix_path(path.to_string_lossy().into_owned().into()),
-                Ok(None) => {}
-                Err(e) => dialogs::error(&format!("File picker failed: {e:#}")),
-            }
-        });
-    }
-
-    {
-        let ui_weak = ui.as_weak();
         ui.on_request_quit(move || {
-            if let Some(ui) = ui_weak.upgrade() {
-                let _ = ui.window().hide();
-            }
-            let _ = slint::quit_event_loop();
+            finish_ui_session(&ui_weak);
         });
     }
 
@@ -742,10 +884,7 @@ fn wire_installer_ui(ui: &AppWindow, auto: Option<GuiOptions>) -> anyhow::Result
             if let Err(e) = claude::launch_registered_claude() {
                 dialogs::error(&format!("Could not launch Claude.\n\n{e:#}"));
             }
-            if let Some(ui) = ui_weak.upgrade() {
-                let _ = ui.window().hide();
-            }
-            let _ = slint::quit_event_loop();
+            finish_ui_session(&ui_weak);
         });
     }
 
@@ -755,11 +894,10 @@ fn wire_installer_ui(ui: &AppWindow, auto: Option<GuiOptions>) -> anyhow::Result
             let Some(ui) = ui_weak.upgrade() else { return };
             let opts = collect_gui_options(&ui);
 
-            if matches!(opts.mode, InstallMode::System) && !elevate::is_elevated() {
+            if install_requires_elevation(&opts) && !elevate::is_elevated() {
                 match elevate::respawn_elevated(&auto_install_args(&opts)) {
                     Ok(()) => {
-                        let _ = ui.window().hide();
-                        let _ = slint::quit_event_loop();
+                        finish_ui_session(&ui_weak);
                     }
                     Err(e) => {
                         ui.set_error_text(format!("Couldn't obtain admin rights: {e:#}").into());
@@ -791,17 +929,21 @@ fn wire_installer_ui(ui: &AppWindow, auto: Option<GuiOptions>) -> anyhow::Result
 }
 
 fn collect_gui_options(ui: &AppWindow) -> GuiOptions {
-    let msix_path = ui.get_msix_path().to_string();
     GuiOptions {
         mode: int_to_install_mode(ui.get_install_mode()),
         root: PathBuf::from(ui.get_install_path().to_string()),
-        source: int_to_fetcher(ui.get_fetcher()),
-        msix_path: (!msix_path.trim().is_empty()).then(|| PathBuf::from(msix_path)),
+        source: Fetcher::Winget,
+        msix_path: None,
         create_shortcut: ui.get_create_shortcut(),
         register_uninstall: ui.get_register_uninstall(),
         keep_downloads: ui.get_keep_downloads(),
         language: int_to_language(ui.get_language()),
     }
+}
+
+fn install_requires_elevation(opts: &GuiOptions) -> bool {
+    matches!(opts.mode, InstallMode::System)
+        || matches!(opts.source, Fetcher::Winget | Fetcher::LocalMsix)
 }
 
 fn start_gui_install(ui_weak: slint::Weak<AppWindow>, opts: GuiOptions) {
@@ -903,11 +1045,11 @@ fn install_updater_files(
         install_mode: opts.mode,
         current_package_version: status.version.clone(),
         current_app_version: read_app_version(status),
-        known_latest: claude::query_winget_metadata().ok().map(|m| m.version),
+        known_latest: claude::query_official_msix_metadata().ok().map(|m| m.version),
         update_policy: UpdatePolicy::default(),
         last_check_unix: Some(now_unix()),
         skipped_version: None,
-        fetcher: opts.source,
+        fetcher: Fetcher::Winget,
         arch: status.architecture.to_ascii_lowercase(),
         post_update_register: true,
         keep_downloads: opts.keep_downloads,
@@ -918,9 +1060,7 @@ fn install_updater_files(
     cfg.save_install(&opts.root)?;
     junction::ensure_versions_layout(&opts.root, status)?;
 
-    let icon = PathBuf::from(&status.install_location)
-        .join("app")
-        .join("Claude.exe");
+    let icon = claude::claude_exe_path(status);
     if opts.create_shortcut {
         if let Some(link) = shortcut::link_path(opts.mode)? {
             shortcut::create_or_update(
@@ -983,10 +1123,7 @@ fn wire_uninstall_ui(ui: &AppWindow, ctx: uninstall::UninstallContext) -> anyhow
     {
         let ui_weak = ui.as_weak();
         ui.on_request_quit(move || {
-            if let Some(ui) = ui_weak.upgrade() {
-                let _ = ui.window().hide();
-            }
-            let _ = slint::quit_event_loop();
+            finish_ui_session(&ui_weak);
         });
     }
 
@@ -1114,22 +1251,6 @@ fn int_to_install_mode(i: i32) -> InstallMode {
     }
 }
 
-fn fetcher_to_int(f: Fetcher) -> i32 {
-    match f {
-        Fetcher::Winget => 0,
-        Fetcher::LocalMsix => 1,
-        Fetcher::ExtractDiagnostic => 2,
-    }
-}
-
-fn int_to_fetcher(i: i32) -> Fetcher {
-    match i {
-        1 => Fetcher::LocalMsix,
-        2 => Fetcher::ExtractDiagnostic,
-        _ => Fetcher::Winget,
-    }
-}
-
 fn language_to_int(language: AppLanguage) -> i32 {
     match language {
         AppLanguage::ZhCn => 0,
@@ -1163,6 +1284,9 @@ fn localize_progress_text(language: AppLanguage, text: &str) -> String {
         "Downloading Claude" => "正在下载 Claude".into(),
         "Running Claude installer" => "正在运行 Claude 安装器".into(),
         "Waiting for Anthropic's installer to finish" => "等待 Anthropic 安装器完成".into(),
+        "Installing official MSIX package" => "正在安装官方 MSIX 包".into(),
+        "Preparing Appx registration" => "正在准备 Appx 注册".into(),
+        "Removing developer-registered Claude package" => "正在移除开发者注册的 Claude 包".into(),
         "Verifying registration" => "正在验证注册".into(),
         "Claude is already current" => "Claude 已是最新版本".into(),
         "Checking Windows Appx registration" => "正在检查 Windows Appx 注册".into(),
@@ -1225,7 +1349,7 @@ fn auto_install_args(opts: &GuiOptions) -> String {
         InstallMode::System => "system",
     };
     let source = match opts.source {
-        Fetcher::Winget => "winget",
+        Fetcher::Winget => "official_msix",
         Fetcher::LocalMsix => "local_msix",
         Fetcher::ExtractDiagnostic => "extract_diagnostic",
     };
@@ -1287,6 +1411,10 @@ fn claude_download_dir() -> PathBuf {
 }
 
 fn read_app_version(status: &claude::ClaudePackageStatus) -> Option<String> {
+    if !claude::package_is_appx(status) {
+        return Some(claude::display_version(&status.version));
+    }
+
     let version_path = PathBuf::from(&status.install_location)
         .join("app")
         .join("version");
@@ -1336,5 +1464,126 @@ mod tests {
             progress_text(AppLanguage::EnUs, "Updating Claude", "1.0 MB downloaded"),
             ("Updating Claude".into(), "1.0 MB downloaded".into())
         );
+    }
+
+    #[test]
+    fn cached_latest_newer_than_current_shows_update_available() {
+        let appx = claude::ClaudePackageStatus {
+            package_full_name: "Claude_1.9659.2.0_x64__pzs8sxrjxfjjc".into(),
+            package_family_name: claude::CLAUDE_PACKAGE_FAMILY.into(),
+            version: "1.9659.2.0".into(),
+            architecture: "X64".into(),
+            install_location: r"C:\Program Files\WindowsApps\Claude_1.9659.2.0_x64__pzs8sxrjxfjjc"
+                .into(),
+            signature_kind: Some("Developer".into()),
+        };
+
+        assert_eq!(cached_update_screen(&appx, Some("1.15962.1"), None), Some(12));
+    }
+
+    #[test]
+    fn cached_local_squirrel_same_version_still_shows_update_available() {
+        let local = claude::ClaudePackageStatus {
+            package_full_name: "AnthropicClaude_1.15962.1_x64".into(),
+            package_family_name: claude::CLAUDE_LOCAL_PACKAGE_FAMILY.into(),
+            version: "1.15962.1".into(),
+            architecture: "X64".into(),
+            install_location: r"C:\Users\me\AppData\Local\AnthropicClaude\app-1.15962.1".into(),
+            signature_kind: None,
+        };
+
+        assert_eq!(
+            cached_update_screen(&local, Some("1.15962.1"), None),
+            Some(12)
+        );
+    }
+
+    #[test]
+    fn missing_claude_install_is_treated_as_update_required() {
+        let cfg = Config {
+            install_mode: InstallMode::User,
+            current_package_version: "1.15962.1.0".into(),
+            current_app_version: Some("42.4.0".into()),
+            known_latest: Some("1.15962.1".into()),
+            update_policy: UpdatePolicy::Daily,
+            last_check_unix: Some(now_unix()),
+            skipped_version: None,
+            fetcher: Fetcher::Winget,
+            arch: "x64".into(),
+            post_update_register: true,
+            keep_downloads: false,
+            register_uninstall: true,
+            create_shortcut: true,
+            language: AppLanguage::ZhCn,
+        };
+        let missing = missing_claude_status(&cfg);
+
+        assert_eq!(missing.package_family_name, "missing");
+        assert!(claude_install_is_missing(&missing));
+        assert_eq!(
+            cached_update_screen(&missing, cfg.known_latest.as_deref(), None),
+            Some(12)
+        );
+    }
+
+    #[test]
+    fn rejects_success_when_installed_version_is_still_older_than_latest() {
+        let err = ensure_installed_version("1.9659.2.0", "1.15962.1").unwrap_err();
+        assert!(
+            err.to_string().contains("Claude installer finished"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn local_squirrel_install_does_not_satisfy_official_msix_update() {
+        let local = claude::ClaudePackageStatus {
+            package_full_name: "AnthropicClaude_1.15962.1_x64".into(),
+            package_family_name: claude::CLAUDE_LOCAL_PACKAGE_FAMILY.into(),
+            version: "1.15962.1".into(),
+            architecture: "X64".into(),
+            install_location: r"C:\Users\me\AppData\Local\AnthropicClaude\app-1.15962.1".into(),
+            signature_kind: None,
+        };
+        let appx = claude::ClaudePackageStatus {
+            package_full_name: "Claude_1.15962.1.0_x64__pzs8sxrjxfjjc".into(),
+            package_family_name: claude::CLAUDE_PACKAGE_FAMILY.into(),
+            version: "1.15962.1.0".into(),
+            architecture: "X64".into(),
+            install_location: r"C:\Program Files\WindowsApps\Claude_1.15962.1.0_x64__pzs8sxrjxfjjc"
+                .into(),
+            signature_kind: Some("Store".into()),
+        };
+
+        assert!(!current_install_satisfies_official_msix(
+            &local,
+            "1.15962.1"
+        ));
+        assert!(current_install_satisfies_official_msix(
+            &appx,
+            "1.15962.1"
+        ));
+    }
+
+    #[test]
+    fn msix_install_sources_require_elevation() {
+        let mut opts = GuiOptions {
+            mode: InstallMode::User,
+            root: PathBuf::from(r"C:\Users\me\AppData\Local\ClaudeDesktopUpdater"),
+            source: Fetcher::Winget,
+            msix_path: None,
+            create_shortcut: true,
+            register_uninstall: true,
+            keep_downloads: false,
+            language: AppLanguage::ZhCn,
+        };
+
+        assert!(install_requires_elevation(&opts));
+        opts.source = Fetcher::LocalMsix;
+        assert!(install_requires_elevation(&opts));
+        opts.source = Fetcher::ExtractDiagnostic;
+        assert!(!install_requires_elevation(&opts));
+        opts.mode = InstallMode::System;
+        assert!(install_requires_elevation(&opts));
     }
 }

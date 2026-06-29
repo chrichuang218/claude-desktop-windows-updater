@@ -2,7 +2,7 @@
 
 Unofficial Windows updater and registration repair tool for the **Claude Desktop** app.
 
-The default path uses Anthropic's official Windows installer metadata from `winget`, then verifies that Windows still has Claude registered as an Appx/MSIX package. If registration is missing or stale, it re-registers the existing `AppxManifest.xml`, including StartApps, the `claude:` URL protocol, startup task, packaged service, and firewall rule declarations.
+The default path downloads Anthropic's official Claude Desktop MSIX package, installs it with `Add-AppxPackage`, then verifies that Windows still has Claude registered as an Appx/MSIX package. If registration is missing or stale, it re-registers the existing `AppxManifest.xml`, including StartApps, the `claude:` URL protocol, startup task, packaged service, and firewall rule declarations.
 
 This project is based on `vaportail/codex-windows-updater`; the updater code is MIT licensed. This project is not affiliated with, endorsed by, or sponsored by Anthropic. Claude, Claude Desktop, Anthropic, and related branding are trademarks or assets of Anthropic.
 
@@ -68,11 +68,11 @@ The UI supports Simplified Chinese and English. The selected language is saved i
 | Flag | Effect |
 |---|---|
 | `--status` | Shows the installed Claude Appx package, version, install location, StartApps registration, `claude:` protocol registration, and package-managed integration declarations. |
-| `--check` | Queries `winget show --id Anthropic.Claude --source winget` and prints latest installer metadata. |
-| `--update` | Downloads the official installer URL from winget metadata, verifies SHA-256, runs it, then verifies Appx registration. |
+| `--check` | Resolves Anthropic's official MSIX redirect and prints the latest package metadata. |
+| `--update` | Downloads the official MSIX, installs it with `Add-AppxPackage`, then verifies Appx registration. |
 | `--repair-register` | Re-registers the current Claude `AppxManifest.xml` with `Add-AppxPackage -Register`. |
-| `--msix <path>` | Installs or updates Claude from a local MSIX using `Add-AppxPackage`. |
-| `--extract-msix <path>` | Extracts an MSIX into a diagnostic folder only; this is not a registered install. |
+| `--msix <path>` | Diagnostic CLI path: installs or updates Claude from a local MSIX using `Add-AppxPackage`. This is not shown in the GUI. |
+| `--extract-msix <path>` | Diagnostic CLI path: extracts an MSIX into a diagnostic folder only; this is not a registered install. This is not shown in the GUI. |
 | `--launch` | Starts Claude via `shell:appsFolder\Claude_pzs8sxrjxfjjc!Claude`. |
 | `--uninstall` | Removes this updater. It does not uninstall Anthropic Claude. |
 
@@ -117,10 +117,10 @@ When installed, `Claude Desktop Updater.exe` normally starts Claude through:
 shell:appsFolder\Claude_pzs8sxrjxfjjc!Claude
 ```
 
-It also syncs `updater.json` from the current `Get-AppxPackage -Name Claude` result. When the configured update policy is due, it checks winget metadata; if a newer Claude package is available, it opens the update prompt. Deferring an update records the choice in `updater.json`; updating runs the official installer and then repeats the registration checks above.
+It also syncs `updater.json` from the current `Get-AppxPackage -Name Claude` result. When the configured update policy is due, it checks Anthropic's official MSIX source; if a newer Claude package is available, it opens the update prompt. Deferring an update records the choice in `updater.json`; updating installs the official MSIX and then repeats the registration checks above.
 
 ## Notes
 
 - The updater does not change Claude's own enterprise `disableAutoUpdates` policy.
-- `claude.ai` direct MSIX endpoints can be blocked by Cloudflare for command-line clients, so the default update path relies on `winget` metadata and keeps local MSIX as a fallback.
+- The GUI always uses Anthropic's official MSIX source. Local MSIX install and extraction remain CLI-only diagnostic paths.
 - Start Menu shortcut and Add/Remove Programs entries belong to this updater only and intentionally do not overwrite Anthropic's official Claude entries.

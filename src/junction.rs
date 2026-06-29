@@ -121,6 +121,7 @@ mod tests {
             version: "1.2.3.4".into(),
             architecture: "X64".into(),
             install_location: appx.to_string_lossy().into_owned(),
+            signature_kind: Some("Store".into()),
         };
 
         ensure_versions_layout(&root, &status).expect("versions layout");

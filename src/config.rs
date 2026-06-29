@@ -28,6 +28,7 @@ pub enum UpdatePolicy {
 #[serde(rename_all = "snake_case")]
 pub enum Fetcher {
     #[default]
+    #[serde(rename = "official_msix", alias = "winget", alias = "official")]
     Winget,
     LocalMsix,
     ExtractDiagnostic,
@@ -36,7 +37,7 @@ pub enum Fetcher {
 impl Fetcher {
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "winget" | "official" => Some(Self::Winget),
+            "winget" | "official" | "official_msix" => Some(Self::Winget),
             "local" | "local_msix" | "msix" => Some(Self::LocalMsix),
             "extract" | "extract_diagnostic" | "diagnostic" => Some(Self::ExtractDiagnostic),
             _ => None,
@@ -194,6 +195,7 @@ mod tests {
         assert!(raw.contains("post_update_register"));
         assert!(raw.contains("keep_downloads"));
         assert!(raw.contains("language"));
+        assert!(raw.contains("official_msix"));
         assert!(!raw.contains("current_version"));
         assert!(!raw.contains("use_current_junction"));
     }
@@ -201,6 +203,7 @@ mod tests {
     #[test]
     fn parses_fetcher_aliases() {
         assert_eq!(Fetcher::parse("official"), Some(Fetcher::Winget));
+        assert_eq!(Fetcher::parse("official_msix"), Some(Fetcher::Winget));
         assert_eq!(Fetcher::parse("local_msix"), Some(Fetcher::LocalMsix));
         assert_eq!(
             Fetcher::parse("extract_diagnostic"),

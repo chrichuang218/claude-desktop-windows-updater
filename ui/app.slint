@@ -48,6 +48,10 @@ component DarkButton inherits Rectangle {
         }
     }
     ta := TouchArea {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: parent.height;
         enabled: !root.disabled;
         clicked => { root.clicked(); }
     }
@@ -215,8 +219,6 @@ export component AppWindow inherits Window {
     in-out property <string> install-path;
     in-out property <bool> create-shortcut: true;
     in-out property <bool> register-uninstall: true;
-    in-out property <int> fetcher: 0; // 0=official 1=local msix 2=extract diagnostic
-    in-out property <string> msix-path: "";
     in-out property <bool> keep-downloads: false;
     in-out property <int> language: 0; // 0=zh-CN 1=en-US
     property <bool> zh: language == 0;
@@ -256,7 +258,6 @@ export component AppWindow inherits Window {
     callback request-quit();
     callback mode-selected(int);
     callback path-browse();
-    callback msix-browse();
     // Update-flow callbacks. defer-choice encodes: 0=UpdateNow, 1=NotNow,
     // 2=SkipThisVersion, 3=SnoozeOneDay, 4=SnoozeSevenDays, 5=Never.
     callback request-update(int);
@@ -349,7 +350,7 @@ export component AppWindow inherits Window {
                     wrap: word-wrap;
                 }
                 Text {
-                    text: root.zh ? "使用 Anthropic 官方安装器元数据，并在更新后验证和修复 Windows Appx 注册。" : "Uses Anthropic's official installer metadata, then verifies and repairs Windows Appx registration.";
+                    text: root.zh ? "使用 Anthropic 官方 MSIX，并在更新后验证 Windows Appx 注册。" : "Uses Anthropic's official MSIX, then verifies Windows Appx registration.";
                     color: #6d6358;
                     font-size: 13px;
                     wrap: word-wrap;
@@ -413,30 +414,10 @@ export component AppWindow inherits Window {
                     text: root.zh ? "注册到添加/删除程序（支持一键卸载）" : "Register in Add/Remove Programs (enables one-click uninstall)";
                     checked <=> root.register-uninstall;
                 }
-                HorizontalBox {
-                    padding: 0px;
-                    spacing: 8px;
-                    Text { text: root.zh ? "来源：" : "Source:"; color: #1d1a16; vertical-alignment: center; }
-                    ComboBox {
-                        model: root.zh ? ["官方安装器  (推荐)", "本地 MSIX", "解包诊断"] : ["Official installer  (recommended)", "Local MSIX", "Extract diagnostic"];
-                        current-index <=> root.fetcher;
-                    }
-                }
-
-                if root.fetcher != 0 : HorizontalBox {
-                    padding: 0px;
-                    spacing: 8px;
-                    LineEdit {
-                        text <=> root.msix-path;
-                        horizontal-stretch: 1;
-                    }
-                    DarkButton { text: root.zh ? "MSIX..." : "MSIX..."; clicked => { root.msix-browse(); } }
-                }
-
                 CheckBox { text: root.zh ? "保留下载的安装器缓存" : "Keep downloaded installer cache"; checked <=> root.keep-downloads; }
 
                 Text {
-                    text: root.fetcher == 0 ? (root.zh ? "官方安装器会读取 winget 元数据、校验 SHA-256、运行 Anthropic 安装器，然后检查 Appx 注册。" : "Official installer reads winget metadata, verifies SHA-256, runs Anthropic's installer, then checks Appx registration.") : root.fetcher == 1 ? (root.zh ? "本地 MSIX 会通过 Add-AppxPackage 安装，并在需要时修复注册。" : "Local MSIX installs through Add-AppxPackage and then repairs registration if needed.") : (root.zh ? "解包诊断只会展开 MSIX 用于检查，不会成为正式注册的 Claude 安装。" : "Extract diagnostic unpacks the MSIX for inspection only; it does not become the registered Claude install.");
+                    text: root.zh ? "Claude 安装包会从 Anthropic 官方 MSIX 源下载，并通过 Add-AppxPackage 安装，然后检查 Windows Appx 注册。" : "Claude is downloaded from Anthropic's official MSIX source, installed through Add-AppxPackage, then verified through Windows Appx registration.";
                     color: #83786a;
                     font-size: 11px;
                     wrap: word-wrap;
@@ -549,7 +530,7 @@ export component AppWindow inherits Window {
                     accent: #c86f52;
                 }
                 Text {
-                    text: root.zh ? "正在联系 winget 更新源..." : "Contacting the winget source...";
+                    text: root.zh ? "正在联系 Anthropic MSIX 更新源..." : "Contacting the Anthropic MSIX source...";
                     color: #6d6358;
                     font-size: 12px;
                     horizontal-alignment: center;
@@ -570,7 +551,7 @@ export component AppWindow inherits Window {
                     left-label: root.zh ? "已安装" : "Installed";
                     left-value: root.update-current-version;
                     right-label: root.zh ? "最新版本" : "Latest";
-                    right-value: root.update-latest-version;
+                    right-value: root.update-latest-version == "" ? root.update-current-version : root.update-latest-version;
                 }
                 Rectangle { height: 1px; background: #e2d8c9; }
                 Text { text: root.zh ? "暂时不更新？" : "Don't update now?"; color: #83786a; font-size: 11px; }
@@ -608,7 +589,7 @@ export component AppWindow inherits Window {
                     left-label: root.zh ? "已安装" : "Installed";
                     left-value: root.update-current-version;
                     right-label: root.zh ? "最新版本" : "Latest";
-                    right-value: root.update-latest-version;
+                    right-value: root.update-latest-version == "" ? root.update-current-version : root.update-latest-version;
                 }
                 Rectangle { height: 1px; background: #e2d8c9; }
                 Rectangle { vertical-stretch: 1; }

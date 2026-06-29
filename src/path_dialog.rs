@@ -52,37 +52,3 @@ pub fn pick_folder() -> Result<Option<PathBuf>> {
         Ok(Some(PathBuf::from(path)))
     }
 }
-
-pub fn pick_file() -> Result<Option<PathBuf>> {
-    unsafe {
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-        let dialog: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)
-            .context("CoCreateInstance(FileOpenDialog)")?;
-
-        match dialog.Show(HWND::default()) {
-            Ok(()) => {}
-            Err(e) if e.code().0 as u32 == ERROR_CANCELLED_HR => {
-                CoUninitialize();
-                return Ok(None);
-            }
-            Err(e) => {
-                CoUninitialize();
-                return Err(e).context("IFileOpenDialog::Show");
-            }
-        }
-
-        let item: IShellItem = dialog.GetResult().context("GetResult")?;
-        let pw = item
-            .GetDisplayName(SIGDN_FILESYSPATH)
-            .context("GetDisplayName")?;
-        let mut len = 0usize;
-        while *pw.0.add(len) != 0 {
-            len += 1;
-        }
-        let slice = std::slice::from_raw_parts(pw.0, len);
-        let path = String::from_utf16_lossy(slice);
-        CoTaskMemFree(Some(pw.0 as *mut _));
-        CoUninitialize();
-        Ok(Some(PathBuf::from(path)))
-    }
-}
