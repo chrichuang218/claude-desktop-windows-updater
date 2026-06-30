@@ -309,7 +309,10 @@ pub fn query_local_install_status() -> Result<ClaudePackageStatus> {
 }
 
 pub fn query_best_package_status() -> Result<ClaudePackageStatus> {
-    match (query_package_status().ok(), query_local_install_status().ok()) {
+    match (
+        query_package_status().ok(),
+        query_local_install_status().ok(),
+    ) {
         (Some(appx), Some(local)) => {
             if compare_versions(&local.version, &appx.version) == Ordering::Greater {
                 Ok(local)
@@ -510,8 +513,8 @@ fn windows_powershell() -> Command {
 }
 
 fn local_install_root() -> Result<PathBuf> {
-    let local_app_data = std::env::var_os("LOCALAPPDATA")
-        .ok_or_else(|| anyhow!("LOCALAPPDATA is not set"))?;
+    let local_app_data =
+        std::env::var_os("LOCALAPPDATA").ok_or_else(|| anyhow!("LOCALAPPDATA is not set"))?;
     Ok(PathBuf::from(local_app_data).join(CLAUDE_LOCAL_PACKAGE_FAMILY))
 }
 

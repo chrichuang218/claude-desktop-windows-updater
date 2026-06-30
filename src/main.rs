@@ -14,11 +14,11 @@ mod safety;
 mod shortcut;
 mod uninstall;
 
+use anyhow::Context;
 use config::{
     AppLanguage, Config, Fetcher, InstallMode, UpdatePolicy, APP_DATA_DIR_NAME, CONFIG_FILENAME,
     LEGACY_UPDATER_EXE_NAME, UPDATER_EXE_NAME,
 };
-use anyhow::Context;
 use slint::ComponentHandle;
 use std::cmp::Ordering;
 use std::io::{Read, Write};
@@ -260,7 +260,10 @@ fn run_status() -> anyhow::Result<()> {
         println!("  Launch AppID      : {}", claude::CLAUDE_APP_ID);
     } else {
         println!("  Install type      : Local AnthropicClaude");
-        println!("  Launch executable : {}", claude::claude_exe_path(&status).display());
+        println!(
+            "  Launch executable : {}",
+            claude::claude_exe_path(&status).display()
+        );
     }
     Ok(())
 }
@@ -329,7 +332,8 @@ fn run_auto_update_ui() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("updater.json has no parent directory"))?
         .to_path_buf();
     let cfg = Config::load(&cfg_path)?;
-    let status = claude::query_best_package_status().unwrap_or_else(|_| missing_claude_status(&cfg));
+    let status =
+        claude::query_best_package_status().unwrap_or_else(|_| missing_claude_status(&cfg));
     let latest = claude::query_official_msix_metadata()?;
     let ctx = InstalledUpdateContext {
         root,
@@ -399,17 +403,13 @@ fn update_from_winget_with_progress(
         &format!("Preparing official installer {}", metadata.version),
         Some(0.0),
     );
-    download_file(
-        &metadata.msix_url,
-        &installer,
-        |done, total| {
-            progress(
-                "Downloading Claude",
-                &format_download_detail(done, total),
-                total.map(|t| (done as f32 / t as f32).clamp(0.0, 1.0)),
-            );
-        },
-    )?;
+    download_file(&metadata.msix_url, &installer, |done, total| {
+        progress(
+            "Downloading Claude",
+            &format_download_detail(done, total),
+            total.map(|t| (done as f32 / t as f32).clamp(0.0, 1.0)),
+        );
+    })?;
     if print {
         println!("Running installer: {}", installer.display());
     }
@@ -572,7 +572,9 @@ fn wire_update_ui(ui: &AppWindow, ctx: InstalledUpdateContext) -> anyhow::Result
                             finish_ui_session(&ui_weak);
                         }
                         Err(e) => {
-                            ui.set_error_text(format!("Couldn't obtain admin rights: {e:#}").into());
+                            ui.set_error_text(
+                                format!("Couldn't obtain admin rights: {e:#}").into(),
+                            );
                             ui.set_current_screen(6);
                         }
                     }
@@ -1045,7 +1047,9 @@ fn install_updater_files(
         install_mode: opts.mode,
         current_package_version: status.version.clone(),
         current_app_version: read_app_version(status),
-        known_latest: claude::query_official_msix_metadata().ok().map(|m| m.version),
+        known_latest: claude::query_official_msix_metadata()
+            .ok()
+            .map(|m| m.version),
         update_policy: UpdatePolicy::default(),
         last_check_unix: Some(now_unix()),
         skipped_version: None,
@@ -1478,7 +1482,10 @@ mod tests {
             signature_kind: Some("Developer".into()),
         };
 
-        assert_eq!(cached_update_screen(&appx, Some("1.15962.1"), None), Some(12));
+        assert_eq!(
+            cached_update_screen(&appx, Some("1.15962.1"), None),
+            Some(12)
+        );
     }
 
     #[test]
@@ -1559,10 +1566,7 @@ mod tests {
             &local,
             "1.15962.1"
         ));
-        assert!(current_install_satisfies_official_msix(
-            &appx,
-            "1.15962.1"
-        ));
+        assert!(current_install_satisfies_official_msix(&appx, "1.15962.1"));
     }
 
     #[test]
