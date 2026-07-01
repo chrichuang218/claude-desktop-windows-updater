@@ -449,7 +449,7 @@ fn stop_cowork_service() -> Result<()> {
 
         let _ = CloseServiceHandle(service);
         let _ = CloseServiceHandle(manager);
-        return result;
+        result
     }
 }
 
@@ -468,8 +468,10 @@ fn terminate_official_claude_processes() -> Result<()> {
         let snapshot =
             CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).context("listing processes")?;
         let result = (|| -> Result<()> {
-            let mut entry = PROCESSENTRY32W::default();
-            entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+            let mut entry = PROCESSENTRY32W {
+                dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+                ..Default::default()
+            };
             if Process32FirstW(snapshot, &mut entry).is_err() {
                 return Ok(());
             }
@@ -554,8 +556,10 @@ fn official_claude_process_count() -> Result<usize> {
             CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).context("listing processes")?;
         let result = (|| -> Result<usize> {
             let mut count = 0usize;
-            let mut entry = PROCESSENTRY32W::default();
-            entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+            let mut entry = PROCESSENTRY32W {
+                dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+                ..Default::default()
+            };
             if Process32FirstW(snapshot, &mut entry).is_err() {
                 return Ok(0);
             }
@@ -563,12 +567,10 @@ fn official_claude_process_count() -> Result<usize> {
             loop {
                 if nul_terminated_utf16_to_string(&entry.szExeFile)
                     .eq_ignore_ascii_case("claude.exe")
-                {
-                    if process_image_path(entry.th32ProcessID)
+                    && process_image_path(entry.th32ProcessID)
                         .is_some_and(|path| is_official_claude_path(&path))
-                    {
-                        count += 1;
-                    }
+                {
+                    count += 1;
                 }
 
                 if Process32NextW(snapshot, &mut entry).is_err() {
