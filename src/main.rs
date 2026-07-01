@@ -31,7 +31,7 @@ fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     if args.iter().any(|a| a == "--self-test") {
-        return Ok(());
+        return run_self_test();
     }
     if handle_cli(&args)? {
         return Ok(());
@@ -47,6 +47,12 @@ fn main() -> anyhow::Result<()> {
     wire_installer_ui(&ui, parse_auto_install(&args))?;
     show_when_ready(&ui);
     slint::run_event_loop()?;
+    Ok(())
+}
+
+fn run_self_test() -> anyhow::Result<()> {
+    claude::run_powershell("$PSVersionTable.PSVersion | Out-Null; exit 0")
+        .context("self-test PowerShell launch")?;
     Ok(())
 }
 
@@ -305,6 +311,11 @@ fn run_update_cli() -> anyhow::Result<()> {
 }
 
 fn run_auto_update_ui() -> anyhow::Result<()> {
+    if !elevate::is_elevated() {
+        elevate::respawn_elevated("--auto-update")?;
+        return Ok(());
+    }
+
     let cfg_path = installed_config_path()?;
     let root = cfg_path
         .parent()
@@ -925,12 +936,7 @@ fn wire_installer_ui(ui: &AppWindow, auto: Option<GuiOptions>) -> anyhow::Result
     }
 
     if let Some(auto) = auto {
-        ui.set_current_screen(4);
-        let (phase, detail) = progress_text(auto.language, "Resolving official MSIX", "");
-        ui.set_progress_phase(phase.into());
-        ui.set_progress_detail(detail.into());
-        ui.set_progress_indeterminate(true);
-        start_gui_install(ui.as_weak(), auto);
+        begin_install_action(&ui.as_weak(), ui, auto);
     }
 
     Ok(())
@@ -1328,7 +1334,7 @@ fn error_view_model(
     context: GuiErrorContext,
     err: &anyhow::Error,
 ) -> ErrorViewModel {
-    let detail = format!("{err:#}");
+    let detail = repair_error_detail_mojibake(&format!("{err:#}"));
     let detail_lower = detail.to_ascii_lowercase();
     let retry_action = match context {
         GuiErrorContext::Install => ErrorRetryAction::Install,
@@ -1340,6 +1346,9 @@ fn error_view_model(
         || detail_lower.contains("administrator")
         || detail_lower.contains("elevation")
         || detail_lower.contains("uac")
+        || detail_lower.contains("access is denied")
+        || detail_lower.contains("os error 5")
+        || detail.contains("拒绝访问")
     {
         "elevation"
     } else if detail_lower.contains("official claude msix redirect")
@@ -1426,6 +1435,38 @@ fn error_view_model(
         detail,
         retry_action,
     }
+}
+
+fn repair_error_detail_mojibake(detail: &str) -> String {
+    let repaired = repair_known_windows_mojibake(detail);
+    if repaired != detail {
+        return repaired;
+    }
+
+    if !looks_like_utf8_decoded_as_gbk(detail) {
+        return detail.to_string();
+    }
+
+    let (bytes, _, had_errors) = encoding_rs::GBK.encode(detail);
+    if had_errors {
+        return detail.to_string();
+    }
+    String::from_utf8(bytes.into_owned()).unwrap_or_else(|_| detail.to_string())
+}
+
+fn repair_known_windows_mojibake(detail: &str) -> String {
+    detail
+        .replace("鎸囧畾鐨勬湇鍔℃湭瀹夎銆?", "指定的服务未安装。")
+        .replace("鎸囧畾鐨勬湇鍔℃湭瀹夎銆�", "指定的服务未安装。")
+        .replace("鎷掔粷璁块棶銆?", "拒绝访问。")
+        .replace("鎷掔粷璁块棶銆�", "拒绝访问。")
+}
+
+fn looks_like_utf8_decoded_as_gbk(text: &str) -> bool {
+    const MARKERS: &[char] = &[
+        '鎷', '鎸', '銆', '鐨', '湇', '鍔', '湭', '瀹', '闂', '棶', '粷', '璁',
+    ];
+    text.chars().filter(|ch| MARKERS.contains(ch)).count() >= 2
 }
 
 fn set_gui_error(
@@ -1718,6 +1759,49 @@ mod tests {
         assert_eq!(view.title, "需要管理员权限");
         assert!(view.summary.contains("管理员权限"));
         assert_eq!(view.retry_action, ErrorRetryAction::Install);
+    }
+
+    #[test]
+    fn friendly_error_classifies_access_denied_as_elevation_failure() {
+        let view = error_view_model(
+            AppLanguage::ZhCn,
+            GuiErrorContext::Update,
+            &anyhow::anyhow!("running PowerShell command: Stop-Service: 拒绝访问。 (os error 5)"),
+        );
+
+        assert_eq!(view.title, "需要管理员权限");
+        assert_eq!(view.retry_action, ErrorRetryAction::Update);
+    }
+
+    #[test]
+    fn friendly_error_repairs_mojibake_detail_before_display_and_copy() {
+        let view = error_view_model(
+            AppLanguage::ZhCn,
+            GuiErrorContext::Update,
+            &anyhow::anyhow!("opening CoworkVMService: 鎸囧畾鐨勬湇鍔℃湭瀹夎銆?(0x80070424)"),
+        );
+
+        assert!(
+            view.detail.contains("指定的服务未安装。"),
+            "{}",
+            view.detail
+        );
+        assert!(!view.detail.contains("鎸囧畾"), "{}", view.detail);
+    }
+
+    #[test]
+    fn friendly_error_classifies_mojibake_access_denied_as_elevation_failure() {
+        let view = error_view_model(
+            AppLanguage::ZhCn,
+            GuiErrorContext::Update,
+            &anyhow::anyhow!(
+                "running PowerShell command: Stop-Service: 鎷掔粷璁块棶銆?(os error 5)"
+            ),
+        );
+
+        assert_eq!(view.title, "需要管理员权限");
+        assert!(view.detail.contains("拒绝访问。"), "{}", view.detail);
+        assert_eq!(view.retry_action, ErrorRetryAction::Update);
     }
 
     #[test]

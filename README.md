@@ -6,6 +6,30 @@ The default path downloads Anthropic's official Claude Desktop MSIX package, ins
 
 This project is based on `vaportail/codex-windows-updater`; the updater code is MIT licensed. This project is not affiliated with, endorsed by, or sponsored by Anthropic. Claude, Claude Desktop, Anthropic, and related branding are trademarks or assets of Anthropic.
 
+## Features
+
+- Downloads and installs Anthropic's official Claude Desktop MSIX package.
+- Provides a GUI-first installer and update flow with Simplified Chinese and English UI.
+- Repairs Appx registration for StartApps, `claude:` URL protocol, startup task, packaged service, and firewall declarations.
+- Safely closes the official Claude Appx process during updates without relying on PowerShell process scripts.
+- Keeps a stable `ClaudeDesktopUpdater/versions/current` junction layout for tools and shortcuts.
+
+## Screenshots
+
+![Claude Desktop Updater screenshot 1](assets/screenshots/1.png)
+
+![Claude Desktop Updater screenshot 2](assets/screenshots/2.png)
+
+![Claude Desktop Updater screenshot 3](assets/screenshots/3.png)
+
+![Claude Desktop Updater screenshot 4](assets/screenshots/4.png)
+
+![Claude Desktop Updater screenshot 5](assets/screenshots/5.png)
+
+![Claude Desktop Updater screenshot 6](assets/screenshots/6.png)
+
+![Claude Desktop Updater screenshot 7](assets/screenshots/7.png)
+
 ## Build
 
 Requires Rust 1.80+ and the MSVC toolchain on Windows.
@@ -51,7 +75,11 @@ System:   C:\Program Files\ClaudeDesktopUpdater
 
 The UI supports Simplified Chinese and English. The selected language is saved in `updater.json` as `language: "zh-cn"` or `language: "en-us"` and is reused for future update and uninstall prompts.
 
-## CLI
+## Command-Line Diagnostics
+
+`Claude Desktop Updater.exe` is packaged as a Windows GUI application. Double-clicking it or launching it from Start Menu is the supported first-run/update path.
+
+The flags below are intended for development and diagnostics. In release builds, Windows may not attach GUI-subsystem stdout/stderr to the calling terminal, so prefer the GUI for normal use and inspect the UI error details when troubleshooting.
 
 ```powershell
 & '.\Claude Desktop Updater.exe' --status
@@ -61,7 +89,7 @@ The UI supports Simplified Chinese and English. The selected language is saved i
 & '.\Claude Desktop Updater.exe' --launch
 ```
 
-### Commands
+### Diagnostic Flags
 
 | Flag | Effect |
 |---|---|
@@ -120,3 +148,7 @@ It also syncs `updater.json` from the current `Get-AppxPackage -Name Claude` res
 - The updater does not change Claude's own enterprise `disableAutoUpdates` policy.
 - The updater only supports Anthropic's official MSIX/Appx install path. Legacy local MSIX install and diagnostic extraction flags now return an unsupported-argument error; use `--update`.
 - Start Menu shortcut and Add/Remove Programs entries belong to this updater only and intentionally do not overwrite Anthropic's official Claude entries.
+
+## Acknowledgements / 致谢
+
+🙏 感谢 [LINUX DO](https://linux.do/) 社区的支持与讨论。

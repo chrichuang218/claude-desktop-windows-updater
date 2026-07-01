@@ -5,6 +5,7 @@ use std::cmp::Ordering;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -326,13 +327,7 @@ pub fn query_protocol_registered() -> Result<bool> {
 
 pub fn run_powershell(command: &str) -> Result<()> {
     let output = windows_powershell()
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            command,
-        ])
+        .args(run_powershell_args(command))
         .output()
         .with_context(|| format!("running PowerShell command: {command}"))?;
 
@@ -346,6 +341,10 @@ pub fn run_powershell(command: &str) -> Result<()> {
         String::from_utf8_lossy(&output.stdout).trim(),
         String::from_utf8_lossy(&output.stderr).trim()
     ))
+}
+
+fn run_powershell_args(command: &str) -> [&str; 3] {
+    ["-NoProfile", "-Command", command]
 }
 
 pub fn launch_registered_claude() -> Result<()> {
@@ -387,46 +386,286 @@ pub fn query_official_msix_metadata() -> Result<OfficialMsixMetadata> {
 }
 
 pub fn stop_running_claude() -> Result<()> {
-    run_powershell(stop_running_claude_command())
+    stop_claude_with_native_windows_api()
 }
 
-fn stop_running_claude_command() -> &'static str {
-    r#"
-function Is-OfficialClaudeProcess($process) {
-    $path = $null
-    try { $path = $process.Path } catch { return $false }
-    if ([string]::IsNullOrWhiteSpace($path)) { return $false }
-    return $path -like '*\WindowsApps\Claude_*__pzs8sxrjxfjjc\app\Claude.exe'
+#[cfg(windows)]
+fn stop_claude_with_native_windows_api() -> Result<()> {
+    stop_cowork_service()?;
+    terminate_official_claude_processes()?;
+    wait_until_claude_stopped(Duration::from_secs(5))
 }
 
-try {
-    $service = Get-Service -Name 'CoworkVMService' -ErrorAction SilentlyContinue
-    if ($null -ne $service -and $service.Status -ne 'Stopped') {
-        Stop-Service -Name 'CoworkVMService' -Force -ErrorAction Stop
-        $service.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(15))
+#[cfg(not(windows))]
+fn stop_claude_with_native_windows_api() -> Result<()> {
+    anyhow::bail!("stopping Claude is only supported on Windows")
+}
+
+#[cfg(windows)]
+fn stop_cowork_service() -> Result<()> {
+    use windows::core::PCWSTR;
+    use windows::Win32::System::Services::{
+        CloseServiceHandle, ControlService, OpenSCManagerW, OpenServiceW, SC_MANAGER_CONNECT,
+        SERVICE_CONTROL_STOP, SERVICE_QUERY_STATUS, SERVICE_STATUS, SERVICE_STOP, SERVICE_STOPPED,
+    };
+
+    unsafe {
+        let manager = OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT)
+            .context("opening Windows service manager")?;
+        let service_name = wide_utf16(CLAUDE_SERVICE_NAME);
+        let service = match OpenServiceW(
+            manager,
+            PCWSTR(service_name.as_ptr()),
+            SERVICE_QUERY_STATUS | SERVICE_STOP,
+        ) {
+            Ok(service) => service,
+            Err(err) => {
+                let _ = CloseServiceHandle(manager);
+                if is_service_not_installed_error(err.code().0) {
+                    return Ok(());
+                }
+                return Err(anyhow!("opening {CLAUDE_SERVICE_NAME}: {err}"));
+            }
+        };
+
+        let result = (|| -> Result<()> {
+            if service_state(service)? == SERVICE_STOPPED {
+                return Ok(());
+            }
+
+            let mut status = SERVICE_STATUS::default();
+            ControlService(service, SERVICE_CONTROL_STOP, &mut status)
+                .with_context(|| format!("stopping {CLAUDE_SERVICE_NAME}"))?;
+
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_secs(15) {
+                if service_state(service)? == SERVICE_STOPPED {
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            anyhow::bail!("timed out stopping {CLAUDE_SERVICE_NAME}")
+        })();
+
+        let _ = CloseServiceHandle(service);
+        let _ = CloseServiceHandle(manager);
+        return result;
     }
-} catch {
-    Write-Error ("Failed to stop CoworkVMService: {0}" -f $_.Exception.Message)
-    exit 1
 }
 
-$targets = @(Get-Process -Name claude -ErrorAction SilentlyContinue | Where-Object { Is-OfficialClaudeProcess $_ })
-foreach ($process in $targets) {
-    try { Stop-Process -Id $process.Id -Force -ErrorAction Stop } catch {}
+#[cfg(windows)]
+fn terminate_official_claude_processes() -> Result<()> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows::Win32::System::Threading::{
+        OpenProcess, TerminateProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    };
+
+    unsafe {
+        let snapshot =
+            CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).context("listing processes")?;
+        let result = (|| -> Result<()> {
+            let mut entry = PROCESSENTRY32W::default();
+            entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+            if Process32FirstW(snapshot, &mut entry).is_err() {
+                return Ok(());
+            }
+
+            loop {
+                if process_name_eq(&entry, "claude.exe")
+                    && is_official_claude_process(entry.th32ProcessID)
+                {
+                    let process = match OpenProcess(
+                        PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+                        false,
+                        entry.th32ProcessID,
+                    ) {
+                        Ok(process) => process,
+                        Err(err) if is_process_already_exited_error(err.code().0) => {
+                            continue;
+                        }
+                        Err(err) => {
+                            return Err(err).with_context(|| {
+                                format!("opening Claude process {}", entry.th32ProcessID)
+                            });
+                        }
+                    };
+                    let terminate_result = TerminateProcess(process, 1).with_context(|| {
+                        format!("terminating Claude process {}", entry.th32ProcessID)
+                    });
+                    let _ = CloseHandle(process);
+                    if let Err(err) = terminate_result {
+                        if !windows_error_chain_contains(&err, is_process_already_exited_error) {
+                            return Err(err);
+                        }
+                    }
+                }
+
+                if Process32NextW(snapshot, &mut entry).is_err() {
+                    break;
+                }
+            }
+            Ok(())
+        })();
+        let _ = CloseHandle(snapshot);
+        return result;
+    }
+
+    fn process_name_eq(entry: &PROCESSENTRY32W, expected: &str) -> bool {
+        nul_terminated_utf16_to_string(&entry.szExeFile).eq_ignore_ascii_case(expected)
+    }
+
+    unsafe fn is_official_claude_process(pid: u32) -> bool {
+        process_image_path(pid).is_some_and(|path| is_official_claude_path(&path))
+    }
 }
-Start-Sleep -Milliseconds 500
-$service = Get-Service -Name 'CoworkVMService' -ErrorAction SilentlyContinue
-if ($null -ne $service -and $service.Status -ne 'Stopped') {
-    Write-Error "Failed to stop CoworkVMService"
-    exit 1
+
+#[cfg(windows)]
+fn wait_until_claude_stopped(timeout: Duration) -> Result<()> {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        let running = official_claude_process_count()?;
+        if running == 0 {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let running = official_claude_process_count()?;
+    if running == 0 {
+        Ok(())
+    } else {
+        anyhow::bail!("failed to stop {running} Claude process(es)")
+    }
 }
-$still = @(Get-Process -Name claude -ErrorAction SilentlyContinue | Where-Object { Is-OfficialClaudeProcess $_ })
-if ($still.Count -gt 0) {
-    Write-Error ("Failed to stop {0} Claude process(es)" -f $still.Count)
-    exit 1
+
+#[cfg(windows)]
+fn official_claude_process_count() -> Result<usize> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+
+    unsafe {
+        let snapshot =
+            CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).context("listing processes")?;
+        let result = (|| -> Result<usize> {
+            let mut count = 0usize;
+            let mut entry = PROCESSENTRY32W::default();
+            entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+            if Process32FirstW(snapshot, &mut entry).is_err() {
+                return Ok(0);
+            }
+
+            loop {
+                if nul_terminated_utf16_to_string(&entry.szExeFile)
+                    .eq_ignore_ascii_case("claude.exe")
+                {
+                    if process_image_path(entry.th32ProcessID)
+                        .is_some_and(|path| is_official_claude_path(&path))
+                    {
+                        count += 1;
+                    }
+                }
+
+                if Process32NextW(snapshot, &mut entry).is_err() {
+                    break;
+                }
+            }
+            Ok(count)
+        })();
+        let _ = CloseHandle(snapshot);
+        result
+    }
 }
-exit 0
-"#
+
+#[cfg(windows)]
+unsafe fn service_state(
+    service: windows::Win32::System::Services::SC_HANDLE,
+) -> Result<windows::Win32::System::Services::SERVICE_STATUS_CURRENT_STATE> {
+    use std::mem::size_of;
+    use windows::Win32::System::Services::{
+        QueryServiceStatusEx, SC_STATUS_PROCESS_INFO, SERVICE_STATUS_PROCESS,
+    };
+
+    let mut status = SERVICE_STATUS_PROCESS::default();
+    let mut needed = 0u32;
+    let buffer = std::slice::from_raw_parts_mut(
+        &mut status as *mut _ as *mut u8,
+        size_of::<SERVICE_STATUS_PROCESS>(),
+    );
+    QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO, Some(buffer), &mut needed)
+        .with_context(|| format!("querying {CLAUDE_SERVICE_NAME} status"))?;
+    Ok(status.dwCurrentState)
+}
+
+#[cfg(windows)]
+unsafe fn process_image_path(pid: u32) -> Option<String> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+        return None;
+    };
+    let mut buffer = vec![0u16; 32768];
+    let mut size = buffer.len() as u32;
+    let ok = QueryFullProcessImageNameW(
+        process,
+        PROCESS_NAME_WIN32,
+        windows::core::PWSTR(buffer.as_mut_ptr()),
+        &mut size,
+    )
+    .is_ok();
+    let _ = CloseHandle(process);
+    if !ok || size == 0 {
+        return None;
+    }
+    Some(String::from_utf16_lossy(&buffer[..size as usize]).replace('/', "\\"))
+}
+
+fn is_official_claude_path(path: &str) -> bool {
+    let path = path.replace('/', "\\").to_ascii_lowercase();
+    path.contains(r"\windowsapps\claude_") && path.ends_with(r"__pzs8sxrjxfjjc\app\claude.exe")
+}
+
+fn is_service_not_installed_error(code: i32) -> bool {
+    const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
+    const HRESULT_FROM_ERROR_SERVICE_DOES_NOT_EXIST: i32 = 0x80070424u32 as i32;
+    code == ERROR_SERVICE_DOES_NOT_EXIST || code == HRESULT_FROM_ERROR_SERVICE_DOES_NOT_EXIST
+}
+
+fn is_process_already_exited_error(code: i32) -> bool {
+    const ERROR_INVALID_PARAMETER: i32 = 87;
+    const HRESULT_FROM_ERROR_INVALID_PARAMETER: i32 = 0x80070057u32 as i32;
+    code == ERROR_INVALID_PARAMETER || code == HRESULT_FROM_ERROR_INVALID_PARAMETER
+}
+
+fn windows_error_chain_contains(err: &anyhow::Error, predicate: impl Fn(i32) -> bool) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<windows::core::Error>()
+            .is_some_and(|windows_err| predicate(windows_err.code().0))
+    })
+}
+
+#[cfg(windows)]
+fn wide_utf16(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(windows)]
+fn nul_terminated_utf16_to_string(buffer: &[u16]) -> String {
+    let len = buffer
+        .iter()
+        .position(|ch| *ch == 0)
+        .unwrap_or(buffer.len());
+    String::from_utf16_lossy(&buffer[..len])
 }
 
 fn windows_powershell() -> Command {
@@ -643,13 +882,41 @@ Claude         Claude_pzs8sxrjxfjjc!Claude
     }
 
     #[test]
-    fn stop_running_claude_script_treats_no_process_as_success() {
-        let command = stop_running_claude_command();
-        assert!(command.contains("CoworkVMService"));
-        assert!(command.contains("Stop-Service"));
-        assert!(command.contains("exit 0"));
-        assert!(command.contains("exit 1"));
-        assert!(command.contains("Get-Process -Name claude"));
+    fn recognizes_only_official_claude_process_paths() {
+        assert!(is_official_claude_path(
+            r"C:\Program Files\WindowsApps\Claude_1.15962.1.0_x64__pzs8sxrjxfjjc\app\Claude.exe"
+        ));
+        assert!(is_official_claude_path(
+            r"C:/Program Files/WindowsApps/Claude_1.15962.1.0_x64__pzs8sxrjxfjjc/app/Claude.exe"
+        ));
+        assert!(!is_official_claude_path(
+            r"D:\Tools\Claude_1.15962.1.0_x64__pzs8sxrjxfjjc\app\Claude.exe"
+        ));
+        assert!(!is_official_claude_path(
+            r"C:\Program Files\WindowsApps\Other_1.0.0.0_x64__pzs8sxrjxfjjc\app\Claude.exe"
+        ));
+    }
+
+    #[test]
+    fn recognizes_service_not_installed_errors() {
+        assert!(is_service_not_installed_error(1060));
+        assert!(is_service_not_installed_error(0x80070424u32 as i32));
+        assert!(!is_service_not_installed_error(5));
+    }
+
+    #[test]
+    fn recognizes_process_already_exited_errors() {
+        assert!(is_process_already_exited_error(87));
+        assert!(is_process_already_exited_error(0x80070057u32 as i32));
+        assert!(!is_process_already_exited_error(5));
+    }
+
+    #[test]
+    fn run_powershell_does_not_request_execution_policy_bypass() {
+        let args = run_powershell_args("exit 0");
+
+        assert_eq!(args, ["-NoProfile", "-Command", "exit 0"]);
+        assert!(!args.iter().any(|arg| arg.eq_ignore_ascii_case("Bypass")));
     }
 
     #[test]
