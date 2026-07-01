@@ -18,8 +18,7 @@ pub const CLAUDE_SERVICE_NAME: &str = "CoworkVMService";
 pub const CLAUDE_EXE: &str = r"app\Claude.exe";
 pub const CLAUDE_COWORK_EXE: &str = r"app\resources\cowork-svc.exe";
 pub const CLAUDE_MSIX_LATEST_X64_URL: &str =
-    "https://claude.ai/api/desktop/win32/x64/msix/latest/redirect";
-pub const CLAUDE_LOCAL_PACKAGE_FAMILY: &str = "AnthropicClaude";
+    "https://api.anthropic.com/api/desktop/win32/x64/msix/latest/redirect";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OfficialMsixMetadata {
@@ -266,66 +265,6 @@ pub fn parse_msix_version_from_url(url: &str) -> Result<String> {
     Ok(version.to_string())
 }
 
-pub fn query_local_install_status() -> Result<ClaudePackageStatus> {
-    let root = local_install_root()?;
-    let mut best: Option<(String, PathBuf)> = None;
-    for entry in std::fs::read_dir(&root).with_context(|| format!("reading {}", root.display()))? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
-        }
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let Some(version) = name.strip_prefix("app-").map(str::to_string) else {
-            continue;
-        };
-        let app_dir = entry.path();
-        if !app_dir.join("claude.exe").is_file() {
-            continue;
-        }
-        let is_newer = best
-            .as_ref()
-            .map(|(current, _)| compare_versions(&version, current) == Ordering::Greater)
-            .unwrap_or(true);
-        if is_newer {
-            best = Some((version, app_dir));
-        }
-    }
-
-    let (version, app_dir) = best.ok_or_else(|| {
-        anyhow!(
-            "no local AnthropicClaude app-* install found under {}",
-            root.display()
-        )
-    })?;
-
-    Ok(ClaudePackageStatus {
-        package_full_name: format!("AnthropicClaude_{}_x64", version),
-        package_family_name: CLAUDE_LOCAL_PACKAGE_FAMILY.into(),
-        version,
-        architecture: "X64".into(),
-        install_location: app_dir.to_string_lossy().into_owned(),
-        signature_kind: None,
-    })
-}
-
-pub fn query_best_package_status() -> Result<ClaudePackageStatus> {
-    match (
-        query_package_status().ok(),
-        query_local_install_status().ok(),
-    ) {
-        (Some(appx), Some(local)) => {
-            if compare_versions(&local.version, &appx.version) == Ordering::Greater {
-                Ok(local)
-            } else {
-                Ok(appx)
-            }
-        }
-        (Some(appx), None) => Ok(appx),
-        (None, Some(local)) => Ok(local),
-        (None, None) => anyhow::bail!("Claude is not installed as Appx or local AnthropicClaude"),
-    }
-}
-
 pub fn package_is_appx(status: &ClaudePackageStatus) -> bool {
     status.package_family_name == CLAUDE_PACKAGE_FAMILY
 }
@@ -338,12 +277,9 @@ pub fn package_is_developer_signed(status: &ClaudePackageStatus) -> bool {
 }
 
 pub fn claude_exe_path(status: &ClaudePackageStatus) -> PathBuf {
-    let root = PathBuf::from(&status.install_location);
-    if package_is_appx(status) {
-        root.join("app").join("Claude.exe")
-    } else {
-        root.join("claude.exe")
-    }
+    PathBuf::from(&status.install_location)
+        .join("app")
+        .join("Claude.exe")
 }
 
 pub fn query_start_apps_registered() -> Result<bool> {
@@ -413,16 +349,6 @@ pub fn run_powershell(command: &str) -> Result<()> {
 }
 
 pub fn launch_registered_claude() -> Result<()> {
-    if let Ok(status) = query_best_package_status() {
-        if !package_is_appx(&status) {
-            let exe = claude_exe_path(&status);
-            command_no_window(&exe)
-                .spawn()
-                .with_context(|| format!("launching Claude at {}", exe.display()))?;
-            return Ok(());
-        }
-    }
-
     command_no_window("explorer.exe")
         .arg(format!(r"shell:appsFolder\{CLAUDE_APP_ID}"))
         .spawn()
@@ -466,12 +392,11 @@ pub fn stop_running_claude() -> Result<()> {
 
 fn stop_running_claude_command() -> &'static str {
     r#"
-$local = Join-Path $env:LOCALAPPDATA 'AnthropicClaude'
 function Is-OfficialClaudeProcess($process) {
     $path = $null
     try { $path = $process.Path } catch { return $false }
     if ([string]::IsNullOrWhiteSpace($path)) { return $false }
-    return $path -like '*\WindowsApps\Claude_*__pzs8sxrjxfjjc\app\Claude.exe' -or $path -like "$local\*"
+    return $path -like '*\WindowsApps\Claude_*__pzs8sxrjxfjjc\app\Claude.exe'
 }
 
 try {
@@ -510,12 +435,6 @@ fn windows_powershell() -> Command {
         r"{}\System32\WindowsPowerShell\v1.0\powershell.exe",
         system_root
     ))
-}
-
-fn local_install_root() -> Result<PathBuf> {
-    let local_app_data =
-        std::env::var_os("LOCALAPPDATA").ok_or_else(|| anyhow!("LOCALAPPDATA is not set"))?;
-    Ok(PathBuf::from(local_app_data).join(CLAUDE_LOCAL_PACKAGE_FAMILY))
 }
 
 fn command_no_window(program: impl AsRef<OsStr>) -> Command {
@@ -571,6 +490,11 @@ mod tests {
         .expect("msix version");
 
         assert_eq!(version, "1.15962.1");
+    }
+
+    #[test]
+    fn official_msix_redirect_uses_programmatic_api_host() {
+        assert!(CLAUDE_MSIX_LATEST_X64_URL.starts_with("https://api.anthropic.com/"));
     }
 
     #[test]
@@ -672,19 +596,22 @@ Claude         Claude_pzs8sxrjxfjjc!Claude
     }
 
     #[test]
-    fn local_install_uses_root_claude_exe() {
+    fn appx_install_uses_packaged_claude_exe() {
         let status = ClaudePackageStatus {
-            package_full_name: "AnthropicClaude_1.15962.1_x64".into(),
-            package_family_name: CLAUDE_LOCAL_PACKAGE_FAMILY.into(),
-            version: "1.15962.1".into(),
+            package_full_name: "Claude_1.15962.1.0_x64__pzs8sxrjxfjjc".into(),
+            package_family_name: CLAUDE_PACKAGE_FAMILY.into(),
+            version: "1.15962.1.0".into(),
             architecture: "X64".into(),
-            install_location: r"C:\Users\me\AppData\Local\AnthropicClaude\app-1.15962.1".into(),
-            signature_kind: None,
+            install_location: r"C:\Program Files\WindowsApps\Claude_1.15962.1.0_x64__pzs8sxrjxfjjc"
+                .into(),
+            signature_kind: Some("Store".into()),
         };
 
         assert_eq!(
             claude_exe_path(&status),
-            PathBuf::from(r"C:\Users\me\AppData\Local\AnthropicClaude\app-1.15962.1\claude.exe")
+            PathBuf::from(
+                r"C:\Program Files\WindowsApps\Claude_1.15962.1.0_x64__pzs8sxrjxfjjc\app\Claude.exe"
+            )
         );
     }
 

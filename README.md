@@ -58,8 +58,6 @@ The UI supports Simplified Chinese and English. The selected language is saved i
 & '.\Claude Desktop Updater.exe' --check
 & '.\Claude Desktop Updater.exe' --update
 & '.\Claude Desktop Updater.exe' --repair-register
-& '.\Claude Desktop Updater.exe' --msix D:\Downloads\Claude.msix
-& '.\Claude Desktop Updater.exe' --extract-msix D:\Downloads\Claude.msix
 & '.\Claude Desktop Updater.exe' --launch
 ```
 
@@ -71,8 +69,6 @@ The UI supports Simplified Chinese and English. The selected language is saved i
 | `--check` | Resolves Anthropic's official MSIX redirect and prints the latest package metadata. |
 | `--update` | Downloads the official MSIX, installs it with `Add-AppxPackage`, then verifies Appx registration. |
 | `--repair-register` | Re-registers the current Claude `AppxManifest.xml` with `Add-AppxPackage -Register`. |
-| `--msix <path>` | Diagnostic CLI path: installs or updates Claude from a local MSIX using `Add-AppxPackage`. This is not shown in the GUI. |
-| `--extract-msix <path>` | Diagnostic CLI path: extracts an MSIX into a diagnostic folder only; this is not a registered install. This is not shown in the GUI. |
 | `--launch` | Starts Claude via `shell:appsFolder\Claude_pzs8sxrjxfjjc!Claude`. |
 | `--uninstall` | Removes this updater. It does not uninstall Anthropic Claude. |
 
@@ -122,5 +118,5 @@ It also syncs `updater.json` from the current `Get-AppxPackage -Name Claude` res
 ## Notes
 
 - The updater does not change Claude's own enterprise `disableAutoUpdates` policy.
-- The GUI always uses Anthropic's official MSIX source. Local MSIX install and extraction remain CLI-only diagnostic paths.
+- The updater only supports Anthropic's official MSIX/Appx install path. Legacy local MSIX install and diagnostic extraction flags now return an unsupported-argument error; use `--update`.
 - Start Menu shortcut and Add/Remove Programs entries belong to this updater only and intentionally do not overwrite Anthropic's official Claude entries.

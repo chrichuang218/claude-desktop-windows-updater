@@ -25,27 +25,6 @@ pub enum UpdatePolicy {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum Fetcher {
-    #[default]
-    #[serde(rename = "official_msix", alias = "winget", alias = "official")]
-    Winget,
-    LocalMsix,
-    ExtractDiagnostic,
-}
-
-impl Fetcher {
-    pub fn parse(s: &str) -> Option<Self> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "winget" | "official" | "official_msix" => Some(Self::Winget),
-            "local" | "local_msix" | "msix" => Some(Self::LocalMsix),
-            "extract" | "extract_diagnostic" | "diagnostic" => Some(Self::ExtractDiagnostic),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum AppLanguage {
     #[default]
@@ -75,8 +54,6 @@ pub struct Config {
     pub last_check_unix: Option<u64>,
     #[serde(default)]
     pub skipped_version: Option<String>,
-    #[serde(default)]
-    pub fetcher: Fetcher,
     #[serde(default = "default_arch")]
     pub arch: String,
     #[serde(default = "default_true")]
@@ -179,7 +156,6 @@ mod tests {
             update_policy: UpdatePolicy::Daily,
             last_check_unix: Some(123),
             skipped_version: None,
-            fetcher: Fetcher::Winget,
             arch: "x64".into(),
             post_update_register: true,
             keep_downloads: false,
@@ -195,20 +171,34 @@ mod tests {
         assert!(raw.contains("post_update_register"));
         assert!(raw.contains("keep_downloads"));
         assert!(raw.contains("language"));
-        assert!(raw.contains("official_msix"));
+        assert!(!raw.contains("fetcher"));
         assert!(!raw.contains("current_version"));
         assert!(!raw.contains("use_current_junction"));
     }
 
     #[test]
-    fn parses_fetcher_aliases() {
-        assert_eq!(Fetcher::parse("official"), Some(Fetcher::Winget));
-        assert_eq!(Fetcher::parse("official_msix"), Some(Fetcher::Winget));
-        assert_eq!(Fetcher::parse("local_msix"), Some(Fetcher::LocalMsix));
-        assert_eq!(
-            Fetcher::parse("extract_diagnostic"),
-            Some(Fetcher::ExtractDiagnostic)
-        );
+    fn ignores_legacy_fetcher_field() {
+        let raw = r#"{
+          "install_mode": "user",
+          "current_package_version": "1.15962.1.0",
+          "current_app_version": "42.4.0",
+          "known_latest": "1.15962.1",
+          "update_policy": "daily",
+          "last_check_unix": 123,
+          "skipped_version": null,
+          "fetcher": "local_msix",
+          "arch": "x64",
+          "post_update_register": true,
+          "keep_downloads": false,
+          "register_uninstall": true,
+          "create_shortcut": true,
+          "language": "zh-cn"
+        }"#;
+
+        let cfg: Config = serde_json::from_str(raw).expect("legacy config");
+        let saved = serde_json::to_string(&cfg).expect("config json");
+
+        assert!(!saved.contains("fetcher"));
     }
 
     #[test]

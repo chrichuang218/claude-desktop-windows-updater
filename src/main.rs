@@ -6,7 +6,6 @@ mod config;
 mod dark_window;
 mod dialogs;
 mod elevate;
-mod extract;
 mod junction;
 mod path_dialog;
 mod registry;
@@ -16,13 +15,14 @@ mod uninstall;
 
 use anyhow::Context;
 use config::{
-    AppLanguage, Config, Fetcher, InstallMode, UpdatePolicy, APP_DATA_DIR_NAME, CONFIG_FILENAME,
+    AppLanguage, Config, InstallMode, UpdatePolicy, APP_DATA_DIR_NAME, CONFIG_FILENAME,
     LEGACY_UPDATER_EXE_NAME, UPDATER_EXE_NAME,
 };
 use slint::ComponentHandle;
 use std::cmp::Ordering;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 slint::include_modules!();
@@ -54,7 +54,7 @@ fn main() -> anyhow::Result<()> {
 struct InstalledUpdateContext {
     root: PathBuf,
     cfg: Config,
-    status: claude::ClaudePackageStatus,
+    status: Option<claude::ClaudePackageStatus>,
     latest: claude::OfficialMsixMetadata,
 }
 
@@ -80,7 +80,7 @@ fn run_installed_mode() -> anyhow::Result<()> {
         .to_path_buf();
     let mut cfg = Config::load(&cfg_path)?;
 
-    let current_status = match claude::query_best_package_status() {
+    let current_status = match claude::query_package_status() {
         Ok(status) => {
             sync_installed_config(&root, &mut cfg, &status, None)?;
             Some(status)
@@ -102,7 +102,7 @@ fn run_installed_mode() -> anyhow::Result<()> {
                         InstalledUpdateContext {
                             root,
                             cfg,
-                            status: status.clone(),
+                            status: Some(status.clone()),
                             latest: claude::OfficialMsixMetadata {
                                 version: known_latest,
                                 msix_url: String::new(),
@@ -116,53 +116,31 @@ fn run_installed_mode() -> anyhow::Result<()> {
         return claude::launch_registered_claude();
     }
 
-    let status = match current_status {
-        Some(status) => status,
-        None => missing_claude_status(&cfg),
-    };
     let latest = claude::query_official_msix_metadata()?;
-    if claude_install_is_missing(&status) {
+    if let Some(status) = current_status.as_ref() {
+        sync_installed_config(&root, &mut cfg, status, Some(latest.version.clone()))?;
+    } else {
         cfg.known_latest = Some(latest.version.clone());
         cfg.last_check_unix = Some(now_unix());
         cfg.save_install(&root)?;
-    } else {
-        sync_installed_config(&root, &mut cfg, &status, Some(latest.version.clone()))?;
     }
 
-    if cfg.skipped_version.as_deref() == Some(latest.version.as_str()) {
+    if current_status.is_some() && cfg.skipped_version.as_deref() == Some(latest.version.as_str()) {
         return claude::launch_registered_claude();
     }
 
-    let current_screen = if current_install_satisfies_official_msix(&status, &latest.version) {
-        13
-    } else {
-        12
-    };
+    let current_screen =
+        update_screen_for_status(current_status.as_ref(), &latest.version, None).unwrap_or(12);
 
     show_update_prompt(
         InstalledUpdateContext {
             root,
             cfg,
-            status,
+            status: current_status,
             latest,
         },
         current_screen,
     )
-}
-
-fn missing_claude_status(cfg: &Config) -> claude::ClaudePackageStatus {
-    claude::ClaudePackageStatus {
-        package_full_name: "Claude_not_installed".into(),
-        package_family_name: "missing".into(),
-        version: cfg.current_package_version.clone(),
-        architecture: cfg.arch.to_ascii_uppercase(),
-        install_location: String::new(),
-        signature_kind: None,
-    }
-}
-
-fn claude_install_is_missing(status: &claude::ClaudePackageStatus) -> bool {
-    status.package_family_name == "missing"
 }
 
 fn cached_update_screen(
@@ -175,7 +153,21 @@ fn cached_update_screen(
         return None;
     }
 
-    if current_install_satisfies_official_msix(current, known_latest) {
+    update_screen_for_status(Some(current), known_latest, skipped_version)
+}
+
+fn update_screen_for_status(
+    current: Option<&claude::ClaudePackageStatus>,
+    latest_version: &str,
+    skipped_version: Option<&str>,
+) -> Option<i32> {
+    if current.is_none() {
+        return Some(14);
+    }
+    if skipped_version == Some(latest_version) {
+        return None;
+    }
+    if current_install_satisfies_official_msix(current?, latest_version) {
         Some(13)
     } else {
         Some(12)
@@ -188,7 +180,13 @@ fn show_update_prompt(ctx: InstalledUpdateContext, current_screen: i32) -> anyho
     prepare_window(&ui);
     ui.set_language(language_to_int(ctx.cfg.language));
     ui.set_current_screen(current_screen);
-    ui.set_update_current_version(claude::display_version(&ctx.status.version).into());
+    ui.set_update_current_version(
+        ctx.status
+            .as_ref()
+            .map(|status| claude::display_version(&status.version))
+            .unwrap_or_else(|| missing_appx_label(ctx.cfg.language).into())
+            .into(),
+    );
     ui.set_update_latest_version(claude::display_version(&ctx.latest.version).into());
     wire_update_ui(&ui, ctx)?;
     show_when_ready(&ui);
@@ -206,17 +204,12 @@ fn handle_cli(args: &[String]) -> anyhow::Result<bool> {
     if args.iter().any(|a| a == "--repair-register") {
         return run_repair_register().map(|_| true);
     }
-    if let Some(msix) = parse_string_flag(args, "--msix") {
-        return run_msix(Path::new(&msix), true).map(|_| true);
-    }
+    reject_unsupported_legacy_cli(args)?;
     if args.iter().any(|a| a == "--update") {
         return run_update_cli().map(|_| true);
     }
     if args.iter().any(|a| a == "--auto-update") {
         return run_auto_update_ui().map(|_| true);
-    }
-    if let Some(msix) = parse_string_flag(args, "--extract-msix") {
-        return run_extract_diagnostic(Path::new(&msix), &std::env::current_dir()?).map(|_| true);
     }
     if args.iter().any(|a| a == "--launch") {
         return claude::launch_registered_claude().map(|_| true);
@@ -227,8 +220,18 @@ fn handle_cli(args: &[String]) -> anyhow::Result<bool> {
     Ok(false)
 }
 
+fn reject_unsupported_legacy_cli(args: &[String]) -> anyhow::Result<()> {
+    const REMOVED: &[&str] = &["--msix", "--extract-msix", "--source", "--msix-path"];
+    if let Some(flag) = args.iter().find(|arg| REMOVED.contains(&arg.as_str())) {
+        anyhow::bail!(
+            "{flag} is no longer supported. Claude Desktop Updater now installs only Anthropic's official MSIX/Appx package; use --update."
+        );
+    }
+    Ok(())
+}
+
 fn run_status() -> anyhow::Result<()> {
-    let status = claude::query_best_package_status()?;
+    let status = claude::query_package_status()?;
 
     println!("Claude package:");
     println!("  PackageFullName   : {}", status.package_full_name);
@@ -244,27 +247,19 @@ fn run_status() -> anyhow::Result<()> {
         "  SignatureKind     : {}",
         status.signature_kind.as_deref().unwrap_or("unknown")
     );
-    if claude::package_is_appx(&status) {
-        let app_id_registered = claude::query_start_apps_registered()?;
-        let protocol_registered = claude::query_protocol_registered()?;
-        let manifest = claude::query_manifest_integrations(&status)?;
-        println!("  Install type      : Appx");
-        println!("  AppID registered  : {}", app_id_registered);
-        println!("  Protocol registered: {}", protocol_registered);
-        println!("  StartupTask declared: {}", manifest.startup_task);
-        println!("  Service declared  : {}", manifest.service);
-        println!(
-            "  Firewall declared : {}",
-            manifest.claude_firewall && manifest.cowork_firewall
-        );
-        println!("  Launch AppID      : {}", claude::CLAUDE_APP_ID);
-    } else {
-        println!("  Install type      : Local AnthropicClaude");
-        println!(
-            "  Launch executable : {}",
-            claude::claude_exe_path(&status).display()
-        );
-    }
+    let app_id_registered = claude::query_start_apps_registered()?;
+    let protocol_registered = claude::query_protocol_registered()?;
+    let manifest = claude::query_manifest_integrations(&status)?;
+    println!("  Install type      : Appx");
+    println!("  AppID registered  : {}", app_id_registered);
+    println!("  Protocol registered: {}", protocol_registered);
+    println!("  StartupTask declared: {}", manifest.startup_task);
+    println!("  Service declared  : {}", manifest.service);
+    println!(
+        "  Firewall declared : {}",
+        manifest.claude_firewall && manifest.cowork_firewall
+    );
+    println!("  Launch AppID      : {}", claude::CLAUDE_APP_ID);
     Ok(())
 }
 
@@ -285,29 +280,13 @@ fn run_repair_register() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_msix(msix: &Path, print: bool) -> anyhow::Result<claude::ClaudePackageStatus> {
-    if !msix.exists() {
-        anyhow::bail!("MSIX file does not exist: {}", msix.display());
-    }
-    if print {
-        println!("Installing Claude MSIX: {}", msix.display());
-    }
-    claude::run_powershell(&claude::msix_install_command(msix))?;
-    verify_claude_registration()?;
-    let status = claude::query_package_status()?;
-    if print {
-        println!("Claude MSIX installed and registered.");
-    }
-    Ok(status)
-}
-
 fn run_update_cli() -> anyhow::Result<()> {
     if !elevate::is_elevated() {
         elevate::respawn_elevated("--update")?;
         return Ok(());
     }
 
-    let before = claude::query_best_package_status().ok();
+    let before = claude::query_package_status().ok();
     let latest = claude::query_official_msix_metadata().ok();
     let status = update_from_winget(false, true)?;
     if before
@@ -332,8 +311,7 @@ fn run_auto_update_ui() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("updater.json has no parent directory"))?
         .to_path_buf();
     let cfg = Config::load(&cfg_path)?;
-    let status =
-        claude::query_best_package_status().unwrap_or_else(|_| missing_claude_status(&cfg));
+    let status = claude::query_package_status().ok();
     let latest = claude::query_official_msix_metadata()?;
     let ctx = InstalledUpdateContext {
         root,
@@ -346,10 +324,11 @@ fn run_auto_update_ui() -> anyhow::Result<()> {
     let ui = AppWindow::new()?;
     prepare_window(&ui);
     ui.set_language(language_to_int(cfg.language));
+    wire_update_ui(&ui, ctx.clone())?;
     ui.set_current_screen(4);
     let (phase, detail) = progress_text(
         cfg.language,
-        "Updating Claude",
+        "Resolving official MSIX",
         "Downloading official installer",
     );
     ui.set_progress_phase(phase.into());
@@ -373,9 +352,14 @@ fn update_from_winget_with_progress(
     print: bool,
     progress: impl Fn(&str, &str, Option<f32>),
 ) -> anyhow::Result<claude::ClaudePackageStatus> {
+    progress(
+        "Resolving official MSIX",
+        "Downloading official installer",
+        None,
+    );
     let metadata = claude::query_official_msix_metadata()?;
 
-    if let Ok(current) = claude::query_best_package_status() {
+    if let Ok(current) = claude::query_package_status() {
         if current_install_satisfies_official_msix(&current, &metadata.version) {
             if print {
                 println!(
@@ -384,9 +368,7 @@ fn update_from_winget_with_progress(
                 );
             }
             progress("Verifying registration", "Claude is already current", None);
-            if claude::package_is_appx(&current) {
-                verify_claude_registration()?;
-            }
+            verify_claude_registration()?;
             return Ok(current);
         }
     }
@@ -436,14 +418,7 @@ fn update_from_winget_with_progress(
         None,
     );
     let status = wait_for_installed_version(&metadata.version)?;
-    if claude::package_is_appx(&status) {
-        verify_claude_registration()?;
-    } else {
-        anyhow::bail!(
-            "Claude MSIX installed, but Windows is still launching a non-Appx install at {}",
-            status.install_location
-        );
-    }
+    verify_claude_registration()?;
     Ok(status)
 }
 
@@ -490,7 +465,7 @@ fn current_install_satisfies_official_msix(
 fn wait_for_installed_version(latest_version: &str) -> anyhow::Result<claude::ClaudePackageStatus> {
     let mut last_status = None;
     for _ in 0..30 {
-        if let Ok(status) = claude::query_best_package_status() {
+        if let Ok(status) = claude::query_package_status() {
             if ensure_installed_version(&status.version, latest_version).is_ok() {
                 return Ok(status);
             }
@@ -518,24 +493,6 @@ fn ensure_installed_version(installed_version: &str, latest_version: &str) -> an
     Ok(())
 }
 
-fn run_extract_diagnostic(msix: &Path, root: &Path) -> anyhow::Result<PathBuf> {
-    if !msix.exists() {
-        anyhow::bail!("MSIX file does not exist: {}", msix.display());
-    }
-    let version = msix
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .and_then(|s| s.split('_').nth(1))
-        .unwrap_or("diagnostic");
-    let out_root = root.join("diagnostic_extract");
-    std::fs::create_dir_all(&out_root)?;
-    let mut progress = |_done: u64, _total: Option<u64>| {};
-    let out = extract::extract_app(msix, &out_root, version, &mut progress)?;
-    println!("Extracted diagnostic copy to {}", out.display());
-    println!("This is not a registered Claude install.");
-    Ok(out)
-}
-
 fn wire_update_ui(ui: &AppWindow, ctx: InstalledUpdateContext) -> anyhow::Result<()> {
     let ctx = std::sync::Arc::new(std::sync::Mutex::new(ctx));
 
@@ -548,9 +505,15 @@ fn wire_update_ui(ui: &AppWindow, ctx: InstalledUpdateContext) -> anyhow::Result
 
     {
         let ui_weak = ui.as_weak();
+        let ctx = ctx.clone();
         ui.on_request_launch(move || {
             if let Err(e) = claude::launch_registered_claude() {
-                dialogs::error(&format!("Could not launch Claude.\n\n{e:#}"));
+                let language = ctx
+                    .lock()
+                    .ok()
+                    .map(|guard| guard.cfg.language)
+                    .unwrap_or_default();
+                show_dialog_error(language, GuiErrorContext::Launch, &e);
             }
             finish_ui_session(&ui_weak);
         });
@@ -566,37 +529,12 @@ fn wire_update_ui(ui: &AppWindow, ctx: InstalledUpdateContext) -> anyhow::Result
             };
 
             if action == 0 {
-                if !elevate::is_elevated() {
-                    match elevate::respawn_elevated("--auto-update") {
-                        Ok(()) => {
-                            finish_ui_session(&ui_weak);
-                        }
-                        Err(e) => {
-                            ui.set_error_text(
-                                format!("Couldn't obtain admin rights: {e:#}").into(),
-                            );
-                            ui.set_current_screen(6);
-                        }
-                    }
-                    return;
-                }
-
-                let (phase, detail) = progress_text(
-                    ctx_snapshot.cfg.language,
-                    "Updating Claude",
-                    "Downloading official installer",
-                );
-                ui.set_current_screen(4);
-                ui.set_progress_phase(phase.into());
-                ui.set_progress_detail(detail.into());
-                ui.set_progress_indeterminate(true);
-                start_gui_update(ui.as_weak(), ctx_snapshot);
+                begin_update_action(&ui_weak, &ui, ctx_snapshot);
                 return;
             }
 
             if let Err(e) = defer_update(action, &ctx_snapshot) {
-                ui.set_error_text(format!("{e:#}").into());
-                ui.set_current_screen(6);
+                set_gui_error(&ui, ctx_snapshot.cfg.language, GuiErrorContext::General, &e);
                 return;
             }
             let _ = claude::launch_registered_claude();
@@ -604,14 +542,71 @@ fn wire_update_ui(ui: &AppWindow, ctx: InstalledUpdateContext) -> anyhow::Result
         });
     }
 
+    {
+        let ui_weak = ui.as_weak();
+        let ctx = ctx.clone();
+        ui.on_request_error_retry(move |action| {
+            if action != ErrorRetryAction::Update.as_i32() {
+                return;
+            }
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let Some(ctx_snapshot) = ctx.lock().ok().map(|guard| (*guard).clone()) else {
+                return;
+            };
+            begin_update_action(&ui_weak, &ui, ctx_snapshot);
+        });
+    }
+
+    {
+        let ui_weak = ui.as_weak();
+        ui.on_request_copy_error(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let detail = ui.get_error_detail().to_string();
+            if let Err(e) = copy_text_to_clipboard(&detail) {
+                dialogs::error(&format!("Could not copy error details.\n\n{e:#}"));
+            }
+        });
+    }
+
     Ok(())
+}
+
+fn begin_update_action(
+    ui_weak: &slint::Weak<AppWindow>,
+    ui: &AppWindow,
+    ctx_snapshot: InstalledUpdateContext,
+) {
+    if !elevate::is_elevated() {
+        match elevate::respawn_elevated("--auto-update") {
+            Ok(()) => {
+                finish_ui_session(ui_weak);
+            }
+            Err(e) => {
+                let err = anyhow::anyhow!("Couldn't obtain admin rights: {e:#}");
+                set_gui_error(ui, ctx_snapshot.cfg.language, GuiErrorContext::Update, &err);
+            }
+        }
+        return;
+    }
+
+    let (phase, detail) = progress_text(
+        ctx_snapshot.cfg.language,
+        "Resolving official MSIX",
+        "Downloading official installer",
+    );
+    ui.set_current_screen(4);
+    ui.set_progress_phase(phase.into());
+    ui.set_progress_detail(detail.into());
+    ui.set_progress_indeterminate(true);
+    start_gui_update(ui.as_weak(), ctx_snapshot);
 }
 
 fn start_gui_update(ui_weak: slint::Weak<AppWindow>, ctx: InstalledUpdateContext) {
     std::thread::spawn(move || {
+        let language = ctx.cfg.language;
         let result = run_gui_update(&ctx, |phase, detail, fraction| {
             let weak = ui_weak.clone();
-            let (phase, detail) = progress_text(ctx.cfg.language, phase, detail);
+            let (phase, detail) = progress_text(language, phase, detail);
             let _ = slint::invoke_from_event_loop(move || {
                 let Some(ui) = weak.upgrade() else { return };
                 ui.set_progress_phase(phase.into());
@@ -637,8 +632,7 @@ fn start_gui_update(ui_weak: slint::Weak<AppWindow>, ctx: InstalledUpdateContext
                     ui.set_current_screen(13);
                 }
                 Err(e) => {
-                    ui.set_error_text(format!("{e:#}").into());
-                    ui.set_current_screen(6);
+                    set_gui_error(&ui, language, GuiErrorContext::Update, &e);
                 }
             }
         });
@@ -649,15 +643,17 @@ fn run_gui_update(
     ctx: &InstalledUpdateContext,
     progress: impl Fn(&str, &str, Option<f32>),
 ) -> anyhow::Result<claude::ClaudePackageStatus> {
-    progress("Updating Claude", "Downloading official installer", None);
+    progress(
+        "Resolving official MSIX",
+        "Downloading official installer",
+        None,
+    );
     let status = update_from_winget_with_progress(ctx.cfg.keep_downloads, false, &progress)?;
     progress("Updating launcher", "Writing updater state", None);
     install_updater_files(
         &GuiOptions {
             mode: ctx.cfg.install_mode,
             root: ctx.root.clone(),
-            source: Fetcher::Winget,
-            msix_path: None,
             create_shortcut: ctx.cfg.create_shortcut,
             register_uninstall: ctx.cfg.register_uninstall,
             keep_downloads: ctx.cfg.keep_downloads,
@@ -692,7 +688,6 @@ fn sync_installed_config(
     cfg.current_package_version = status.version.clone();
     cfg.current_app_version = read_app_version(status);
     cfg.arch = status.architecture.to_ascii_lowercase();
-    cfg.fetcher = Fetcher::Winget;
     if let Some(latest) = known_latest {
         cfg.known_latest = Some(latest);
         cfg.last_check_unix = Some(now_unix());
@@ -823,8 +818,6 @@ fn format_bytes(bytes: u64) -> String {
 struct GuiOptions {
     mode: InstallMode,
     root: PathBuf,
-    source: Fetcher,
-    msix_path: Option<PathBuf>,
     create_shortcut: bool,
     register_uninstall: bool,
     keep_downloads: bool,
@@ -866,7 +859,12 @@ fn wire_installer_ui(ui: &AppWindow, auto: Option<GuiOptions>) -> anyhow::Result
         ui.on_path_browse(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             match path_dialog::pick_folder() {
-                Ok(Some(path)) => ui.set_install_path(path.to_string_lossy().into_owned().into()),
+                Ok(Some(path)) => ui.set_install_path(
+                    normalize_install_root(path)
+                        .to_string_lossy()
+                        .into_owned()
+                        .into(),
+                ),
                 Ok(None) => {}
                 Err(e) => dialogs::error(&format!("Folder picker failed: {e:#}")),
             }
@@ -884,7 +882,11 @@ fn wire_installer_ui(ui: &AppWindow, auto: Option<GuiOptions>) -> anyhow::Result
         let ui_weak = ui.as_weak();
         ui.on_request_launch(move || {
             if let Err(e) = claude::launch_registered_claude() {
-                dialogs::error(&format!("Could not launch Claude.\n\n{e:#}"));
+                let language = ui_weak
+                    .upgrade()
+                    .map(|ui| int_to_language(ui.get_language()))
+                    .unwrap_or_default();
+                show_dialog_error(language, GuiErrorContext::Launch, &e);
             }
             finish_ui_session(&ui_weak);
         });
@@ -895,32 +897,36 @@ fn wire_installer_ui(ui: &AppWindow, auto: Option<GuiOptions>) -> anyhow::Result
         ui.on_request_install(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let opts = collect_gui_options(&ui);
+            begin_install_action(&ui_weak, &ui, opts);
+        });
+    }
 
-            if install_requires_elevation(&opts) && !elevate::is_elevated() {
-                match elevate::respawn_elevated(&auto_install_args(&opts)) {
-                    Ok(()) => {
-                        finish_ui_session(&ui_weak);
-                    }
-                    Err(e) => {
-                        ui.set_error_text(format!("Couldn't obtain admin rights: {e:#}").into());
-                        ui.set_current_screen(6);
-                    }
-                }
+    {
+        let ui_weak = ui.as_weak();
+        ui.on_request_error_retry(move |action| {
+            if action != ErrorRetryAction::Install.as_i32() {
                 return;
             }
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let opts = collect_gui_options(&ui);
+            begin_install_action(&ui_weak, &ui, opts);
+        });
+    }
 
-            ui.set_current_screen(4);
-            let (phase, detail) = progress_text(opts.language, "Starting", "");
-            ui.set_progress_phase(phase.into());
-            ui.set_progress_detail(detail.into());
-            ui.set_progress_indeterminate(true);
-            start_gui_install(ui.as_weak(), opts);
+    {
+        let ui_weak = ui.as_weak();
+        ui.on_request_copy_error(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let detail = ui.get_error_detail().to_string();
+            if let Err(e) = copy_text_to_clipboard(&detail) {
+                dialogs::error(&format!("Could not copy error details.\n\n{e:#}"));
+            }
         });
     }
 
     if let Some(auto) = auto {
         ui.set_current_screen(4);
-        let (phase, detail) = progress_text(auto.language, "Starting", "");
+        let (phase, detail) = progress_text(auto.language, "Resolving official MSIX", "");
         ui.set_progress_phase(phase.into());
         ui.set_progress_detail(detail.into());
         ui.set_progress_indeterminate(true);
@@ -933,9 +939,7 @@ fn wire_installer_ui(ui: &AppWindow, auto: Option<GuiOptions>) -> anyhow::Result
 fn collect_gui_options(ui: &AppWindow) -> GuiOptions {
     GuiOptions {
         mode: int_to_install_mode(ui.get_install_mode()),
-        root: PathBuf::from(ui.get_install_path().to_string()),
-        source: Fetcher::Winget,
-        msix_path: None,
+        root: normalize_install_root(PathBuf::from(ui.get_install_path().to_string())),
         create_shortcut: ui.get_create_shortcut(),
         register_uninstall: ui.get_register_uninstall(),
         keep_downloads: ui.get_keep_downloads(),
@@ -943,9 +947,42 @@ fn collect_gui_options(ui: &AppWindow) -> GuiOptions {
     }
 }
 
-fn install_requires_elevation(opts: &GuiOptions) -> bool {
-    matches!(opts.mode, InstallMode::System)
-        || matches!(opts.source, Fetcher::Winget | Fetcher::LocalMsix)
+fn normalize_install_root(path: PathBuf) -> PathBuf {
+    if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case(APP_DATA_DIR_NAME))
+    {
+        path
+    } else {
+        path.join(APP_DATA_DIR_NAME)
+    }
+}
+
+fn install_requires_elevation(_opts: &GuiOptions) -> bool {
+    true
+}
+
+fn begin_install_action(ui_weak: &slint::Weak<AppWindow>, ui: &AppWindow, opts: GuiOptions) {
+    if install_requires_elevation(&opts) && !elevate::is_elevated() {
+        match elevate::respawn_elevated(&auto_install_args(&opts)) {
+            Ok(()) => {
+                finish_ui_session(ui_weak);
+            }
+            Err(e) => {
+                let err = anyhow::anyhow!("Couldn't obtain admin rights: {e:#}");
+                set_gui_error(ui, opts.language, GuiErrorContext::Install, &err);
+            }
+        }
+        return;
+    }
+
+    ui.set_current_screen(4);
+    let (phase, detail) = progress_text(opts.language, "Resolving official MSIX", "");
+    ui.set_progress_phase(phase.into());
+    ui.set_progress_detail(detail.into());
+    ui.set_progress_indeterminate(true);
+    start_gui_install(ui.as_weak(), opts);
 }
 
 fn start_gui_install(ui_weak: slint::Weak<AppWindow>, opts: GuiOptions) {
@@ -977,8 +1014,7 @@ fn start_gui_install(ui_weak: slint::Weak<AppWindow>, opts: GuiOptions) {
                     ui.set_current_screen(5);
                 }
                 Err(e) => {
-                    ui.set_error_text(format!("{e:#}").into());
-                    ui.set_current_screen(6);
+                    set_gui_error(&ui, language, GuiErrorContext::Install, &e);
                 }
             }
         });
@@ -991,33 +1027,12 @@ fn run_gui_install(
 ) -> anyhow::Result<String> {
     std::fs::create_dir_all(&opts.root)?;
 
-    let status = match opts.source {
-        Fetcher::Winget => {
-            progress("Updating Claude", "Downloading official installer", None);
-            update_from_winget_with_progress(opts.keep_downloads, false, &progress)?
-        }
-        Fetcher::LocalMsix => {
-            let msix = opts
-                .msix_path
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("Local MSIX source requires a file path"))?;
-            progress("Installing Claude MSIX", &msix.display().to_string(), None);
-            run_msix(msix, false)?
-        }
-        Fetcher::ExtractDiagnostic => {
-            let msix = opts
-                .msix_path
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("Diagnostic extract requires an MSIX file path"))?;
-            progress(
-                "Extracting diagnostic copy",
-                &msix.display().to_string(),
-                None,
-            );
-            let out = run_extract_diagnostic(msix, &opts.root)?;
-            return Ok(format!("diagnostic: {}", out.display()));
-        }
-    };
+    progress(
+        "Resolving official MSIX",
+        "Downloading official installer",
+        None,
+    );
+    let status = update_from_winget_with_progress(opts.keep_downloads, false, &progress)?;
 
     progress(
         "Installing updater",
@@ -1053,7 +1068,6 @@ fn install_updater_files(
         update_policy: UpdatePolicy::default(),
         last_check_unix: Some(now_unix()),
         skipped_version: None,
-        fetcher: Fetcher::Winget,
         arch: status.architecture.to_ascii_lowercase(),
         post_update_register: true,
         keep_downloads: opts.keep_downloads,
@@ -1239,6 +1253,13 @@ fn default_path(mode: InstallMode) -> PathBuf {
     }
 }
 
+fn missing_appx_label(language: AppLanguage) -> &'static str {
+    match language {
+        AppLanguage::ZhCn => "未安装",
+        AppLanguage::EnUs => "Not installed",
+    }
+}
+
 fn install_mode_to_int(mode: InstallMode) -> i32 {
     match mode {
         InstallMode::Portable => 0,
@@ -1269,6 +1290,200 @@ fn int_to_language(i: i32) -> AppLanguage {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ErrorRetryAction {
+    None,
+    Install,
+    Update,
+}
+
+impl ErrorRetryAction {
+    fn as_i32(self) -> i32 {
+        match self {
+            ErrorRetryAction::None => 0,
+            ErrorRetryAction::Install => 1,
+            ErrorRetryAction::Update => 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum GuiErrorContext {
+    Install,
+    Update,
+    Launch,
+    General,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ErrorViewModel {
+    title: String,
+    summary: String,
+    detail: String,
+    retry_action: ErrorRetryAction,
+}
+
+fn error_view_model(
+    language: AppLanguage,
+    context: GuiErrorContext,
+    err: &anyhow::Error,
+) -> ErrorViewModel {
+    let detail = format!("{err:#}");
+    let detail_lower = detail.to_ascii_lowercase();
+    let retry_action = match context {
+        GuiErrorContext::Install => ErrorRetryAction::Install,
+        GuiErrorContext::Update => ErrorRetryAction::Update,
+        GuiErrorContext::Launch | GuiErrorContext::General => ErrorRetryAction::None,
+    };
+
+    let kind = if detail_lower.contains("admin rights")
+        || detail_lower.contains("administrator")
+        || detail_lower.contains("elevation")
+        || detail_lower.contains("uac")
+    {
+        "elevation"
+    } else if detail_lower.contains("official claude msix redirect")
+        || detail_lower.contains("http ")
+        || detail_lower.contains("network")
+        || detail_lower.contains("connection")
+        || detail_lower.contains("dns")
+        || detail_lower.contains("timeout")
+        || detail_lower.contains("download")
+    {
+        "network"
+    } else if detail_lower.contains("add-appxpackage")
+        || detail_lower.contains("installing official msix")
+        || detail_lower.contains("deployment")
+    {
+        "appx-install"
+    } else if detail_lower.contains("registered")
+        || detail_lower.contains("registration")
+        || detail_lower.contains("appxmanifest")
+        || detail_lower.contains("startapps")
+        || detail_lower.contains("url protocol")
+    {
+        "registration"
+    } else if matches!(context, GuiErrorContext::Launch) || detail_lower.contains("launch") {
+        "launch"
+    } else {
+        "general"
+    };
+
+    let (title, summary) = match (language, kind) {
+        (AppLanguage::ZhCn, "elevation") => (
+            "需要管理员权限",
+            "安装 Claude 官方 MSIX 需要管理员权限。请在 Windows 权限确认窗口中允许后重试。",
+        ),
+        (AppLanguage::EnUs, "elevation") => (
+            "Administrator rights are required",
+            "Installing the official Claude MSIX requires administrator rights. Allow the Windows prompt, then try again.",
+        ),
+        (AppLanguage::ZhCn, "network") => (
+            "无法连接官方 MSIX 更新源",
+            "可能是网络、代理、公司防火墙或 Anthropic 下载源暂时不可用。请检查网络后重试。",
+        ),
+        (AppLanguage::EnUs, "network") => (
+            "Could not reach the official MSIX source",
+            "Your network, proxy, company firewall, or Anthropic's download source may be unavailable. Check the connection and try again.",
+        ),
+        (AppLanguage::ZhCn, "appx-install") => (
+            "Claude 官方 MSIX 安装失败",
+            "Windows Appx 安装没有完成。请重试；如果仍失败，可复制错误详情排查 Add-AppxPackage 输出。",
+        ),
+        (AppLanguage::EnUs, "appx-install") => (
+            "Claude official MSIX install failed",
+            "Windows Appx installation did not finish. Try again, or copy the details to inspect the Add-AppxPackage output.",
+        ),
+        (AppLanguage::ZhCn, "registration") => (
+            "Claude Appx 注册验证失败",
+            "Claude 已尝试安装或修复注册，但 Windows 集成仍不完整。请重试修复注册，或复制错误详情排查。",
+        ),
+        (AppLanguage::EnUs, "registration") => (
+            "Claude Appx registration check failed",
+            "Claude was installed or registration was repaired, but Windows integrations are still incomplete. Try again or copy the details.",
+        ),
+        (AppLanguage::ZhCn, "launch") => (
+            "无法启动 Claude",
+            "Windows 没有成功通过已注册的 Appx 入口启动 Claude。请确认 Claude 已安装并完成注册。",
+        ),
+        (AppLanguage::EnUs, "launch") => (
+            "Could not launch Claude",
+            "Windows could not start Claude through the registered Appx entry. Confirm Claude is installed and registered.",
+        ),
+        (AppLanguage::ZhCn, _) => (
+            "操作失败",
+            "操作没有完成。你可以重试，或复制错误详情继续排查。",
+        ),
+        (AppLanguage::EnUs, _) => (
+            "Operation failed",
+            "The operation did not finish. Try again, or copy the error details for troubleshooting.",
+        ),
+    };
+
+    ErrorViewModel {
+        title: title.into(),
+        summary: summary.into(),
+        detail,
+        retry_action,
+    }
+}
+
+fn set_gui_error(
+    ui: &AppWindow,
+    language: AppLanguage,
+    context: GuiErrorContext,
+    err: &anyhow::Error,
+) {
+    let view = error_view_model(language, context, err);
+    ui.set_error_title(view.title.into());
+    ui.set_error_summary(view.summary.into());
+    ui.set_error_detail(view.detail.clone().into());
+    ui.set_error_text(view.detail.into());
+    ui.set_error_retry_action(view.retry_action.as_i32());
+    ui.set_current_screen(6);
+}
+
+fn show_dialog_error(language: AppLanguage, context: GuiErrorContext, err: &anyhow::Error) {
+    let view = error_view_model(language, context, err);
+    dialogs::error(&format!(
+        "{}\n\n{}\n\n{}",
+        view.title, view.summary, view.detail
+    ));
+}
+
+fn copy_text_to_clipboard(text: &str) -> anyhow::Result<()> {
+    let mut child = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Set-Clipboard -Value ([Console]::In.ReadToEnd())",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("starting PowerShell clipboard helper")?;
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .context("opening clipboard helper stdin")?;
+        stdin
+            .write_all(text.as_bytes())
+            .context("writing clipboard text")?;
+    }
+    let output = child
+        .wait_with_output()
+        .context("waiting for clipboard helper")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "Set-Clipboard failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 fn progress_text(language: AppLanguage, phase: &str, detail: &str) -> (String, String) {
     (
         localize_progress_text(language, phase),
@@ -1283,10 +1498,13 @@ fn localize_progress_text(language: AppLanguage, text: &str) -> String {
 
     match text {
         "Starting" => "正在开始".into(),
+        "Resolving official MSIX" => "正在连接官方 MSIX 源".into(),
         "Updating Claude" => "正在更新 Claude".into(),
         "Downloading official installer" => "正在下载官方安装器".into(),
         "Downloading Claude" => "正在下载 Claude".into(),
-        "Running Claude installer" => "正在运行 Claude 安装器".into(),
+        "Closing Claude" => "正在关闭 Claude".into(),
+        "Stopping running Claude processes before update" => "正在关闭运行中的 Claude".into(),
+        "Running Claude installer" => "正在安装 Claude Appx".into(),
         "Waiting for Anthropic's installer to finish" => "等待 Anthropic 安装器完成".into(),
         "Installing official MSIX package" => "正在安装官方 MSIX 包".into(),
         "Preparing Appx registration" => "正在准备 Appx 注册".into(),
@@ -1294,12 +1512,11 @@ fn localize_progress_text(language: AppLanguage, text: &str) -> String {
         "Verifying registration" => "正在验证注册".into(),
         "Claude is already current" => "Claude 已是最新版本".into(),
         "Checking Windows Appx registration" => "正在检查 Windows Appx 注册".into(),
-        "Updating launcher" => "正在更新启动器".into(),
+        "Updating launcher" => "正在更新更新器".into(),
         "Writing updater state" => "正在写入更新器状态".into(),
         "Installing Claude MSIX" => "正在安装 Claude MSIX".into(),
-        "Extracting diagnostic copy" => "正在解包诊断副本".into(),
         "Installing updater" => "正在安装更新器".into(),
-        "Writing launcher and registration" => "正在写入启动器和注册信息".into(),
+        "Writing launcher and registration" => "正在写入更新器和注册信息".into(),
         "Validating install" => "正在验证安装".into(),
         "Removing Start Menu shortcut" => "正在移除开始菜单快捷方式".into(),
         "Removing registry entries" => "正在移除注册表项".into(),
@@ -1307,7 +1524,7 @@ fn localize_progress_text(language: AppLanguage, text: &str) -> String {
         "Finalizing" => "正在完成".into(),
         _ => {
             if let Some(version) = text.strip_prefix("Preparing official installer ") {
-                return format!("准备官方安装器 {version}");
+                return format!("准备官方 MSIX 版本 {version}");
             }
             if let Some(bytes) = text.strip_suffix(" downloaded") {
                 return format!("已下载 {bytes}");
@@ -1325,17 +1542,11 @@ fn parse_auto_install(args: &[String]) -> Option<GuiOptions> {
         .as_deref()
         .map(parse_install_mode)
         .unwrap_or(InstallMode::User);
-    let source = parse_string_flag(args, "--source")
-        .as_deref()
-        .and_then(Fetcher::parse)
-        .unwrap_or_default();
     Some(GuiOptions {
         mode,
         root: parse_string_flag(args, "--path")
             .map(PathBuf::from)
             .unwrap_or_else(|| default_path(mode)),
-        source,
-        msix_path: parse_string_flag(args, "--msix-path").map(PathBuf::from),
         create_shortcut: !args.iter().any(|a| a == "--no-shortcut"),
         register_uninstall: !args.iter().any(|a| a == "--no-register-uninstall"),
         keep_downloads: args.iter().any(|a| a == "--keep-downloads"),
@@ -1352,20 +1563,11 @@ fn auto_install_args(opts: &GuiOptions) -> String {
         InstallMode::User => "user",
         InstallMode::System => "system",
     };
-    let source = match opts.source {
-        Fetcher::Winget => "official_msix",
-        Fetcher::LocalMsix => "local_msix",
-        Fetcher::ExtractDiagnostic => "extract_diagnostic",
-    };
     let mut args = format!(
-        "--auto-install --mode {} --path \"{}\" --source {}",
+        "--auto-install --mode {} --path \"{}\"",
         mode,
-        opts.root.display(),
-        source
+        opts.root.display()
     );
-    if let Some(msix) = &opts.msix_path {
-        args.push_str(&format!(" --msix-path \"{}\"", msix.display()));
-    }
     if !opts.create_shortcut {
         args.push_str(" --no-shortcut");
     }
@@ -1415,10 +1617,6 @@ fn claude_download_dir() -> PathBuf {
 }
 
 fn read_app_version(status: &claude::ClaudePackageStatus) -> Option<String> {
-    if !claude::package_is_appx(status) {
-        return Some(claude::display_version(&status.version));
-    }
-
     let version_path = PathBuf::from(&status.install_location)
         .join("app")
         .join("version");
@@ -1459,15 +1657,92 @@ mod tests {
         assert_eq!(
             progress_text(
                 AppLanguage::ZhCn,
-                "Updating Claude",
+                "Resolving official MSIX",
                 "Preparing official installer 1.2.3"
             ),
-            ("正在更新 Claude".into(), "准备官方安装器 1.2.3".into())
+            (
+                "正在连接官方 MSIX 源".into(),
+                "准备官方 MSIX 版本 1.2.3".into()
+            )
         );
         assert_eq!(
             progress_text(AppLanguage::EnUs, "Updating Claude", "1.0 MB downloaded"),
             ("Updating Claude".into(), "1.0 MB downloaded".into())
         );
+        assert_eq!(
+            progress_text(
+                AppLanguage::ZhCn,
+                "Updating launcher",
+                "Writing updater state"
+            ),
+            ("正在更新更新器".into(), "正在写入更新器状态".into())
+        );
+    }
+
+    #[test]
+    fn friendly_error_keeps_http_redirect_detail() {
+        let view = error_view_model(
+            AppLanguage::ZhCn,
+            GuiErrorContext::Update,
+            &anyhow::anyhow!("official Claude MSIX redirect returned HTTP 403 Forbidden"),
+        );
+
+        assert_eq!(view.title, "无法连接官方 MSIX 更新源");
+        assert!(view.summary.contains("网络、代理"));
+        assert!(view.detail.contains("HTTP 403 Forbidden"));
+        assert_eq!(view.retry_action, ErrorRetryAction::Update);
+    }
+
+    #[test]
+    fn friendly_error_classifies_appx_install_failure() {
+        let view = error_view_model(
+            AppLanguage::ZhCn,
+            GuiErrorContext::Install,
+            &anyhow::anyhow!("Add-AppxPackage failed: deployment failed"),
+        );
+
+        assert_eq!(view.title, "Claude 官方 MSIX 安装失败");
+        assert!(view.summary.contains("Windows Appx"));
+        assert!(view.detail.contains("Add-AppxPackage failed"));
+        assert_eq!(view.retry_action, ErrorRetryAction::Install);
+    }
+
+    #[test]
+    fn friendly_error_classifies_elevation_failure() {
+        let view = error_view_model(
+            AppLanguage::ZhCn,
+            GuiErrorContext::Install,
+            &anyhow::anyhow!("Couldn't obtain admin rights: canceled"),
+        );
+
+        assert_eq!(view.title, "需要管理员权限");
+        assert!(view.summary.contains("管理员权限"));
+        assert_eq!(view.retry_action, ErrorRetryAction::Install);
+    }
+
+    #[test]
+    fn friendly_error_classifies_registration_failure() {
+        let view = error_view_model(
+            AppLanguage::ZhCn,
+            GuiErrorContext::Update,
+            &anyhow::anyhow!("Claude URL protocol was not registered after repair"),
+        );
+
+        assert_eq!(view.title, "Claude Appx 注册验证失败");
+        assert!(view.summary.contains("修复注册"));
+        assert_eq!(view.retry_action, ErrorRetryAction::Update);
+    }
+
+    #[test]
+    fn friendly_error_launch_has_no_retry_action() {
+        let view = error_view_model(
+            AppLanguage::ZhCn,
+            GuiErrorContext::Launch,
+            &anyhow::anyhow!("Could not launch Claude"),
+        );
+
+        assert_eq!(view.title, "无法启动 Claude");
+        assert_eq!(view.retry_action, ErrorRetryAction::None);
     }
 
     #[test]
@@ -1489,24 +1764,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_local_squirrel_same_version_still_shows_update_available() {
-        let local = claude::ClaudePackageStatus {
-            package_full_name: "AnthropicClaude_1.15962.1_x64".into(),
-            package_family_name: claude::CLAUDE_LOCAL_PACKAGE_FAMILY.into(),
-            version: "1.15962.1".into(),
-            architecture: "X64".into(),
-            install_location: r"C:\Users\me\AppData\Local\AnthropicClaude\app-1.15962.1".into(),
-            signature_kind: None,
-        };
-
-        assert_eq!(
-            cached_update_screen(&local, Some("1.15962.1"), None),
-            Some(12)
-        );
-    }
-
-    #[test]
-    fn missing_claude_install_is_treated_as_update_required() {
+    fn missing_appx_install_requires_official_msix_install() {
         let cfg = Config {
             install_mode: InstallMode::User,
             current_package_version: "1.15962.1.0".into(),
@@ -1515,7 +1773,6 @@ mod tests {
             update_policy: UpdatePolicy::Daily,
             last_check_unix: Some(now_unix()),
             skipped_version: None,
-            fetcher: Fetcher::Winget,
             arch: "x64".into(),
             post_update_register: true,
             keep_downloads: false,
@@ -1523,14 +1780,25 @@ mod tests {
             create_shortcut: true,
             language: AppLanguage::ZhCn,
         };
-        let missing = missing_claude_status(&cfg);
 
-        assert_eq!(missing.package_family_name, "missing");
-        assert!(claude_install_is_missing(&missing));
         assert_eq!(
-            cached_update_screen(&missing, cfg.known_latest.as_deref(), None),
-            Some(12)
+            update_screen_for_status(None, cfg.known_latest.as_deref().unwrap(), None),
+            Some(14)
         );
+        assert_eq!(
+            update_screen_for_status(
+                None,
+                cfg.known_latest.as_deref().unwrap(),
+                cfg.known_latest.as_deref()
+            ),
+            Some(14)
+        );
+    }
+
+    #[test]
+    fn missing_appx_label_is_localized() {
+        assert_eq!(missing_appx_label(AppLanguage::ZhCn), "未安装");
+        assert_eq!(missing_appx_label(AppLanguage::EnUs), "Not installed");
     }
 
     #[test]
@@ -1543,15 +1811,7 @@ mod tests {
     }
 
     #[test]
-    fn local_squirrel_install_does_not_satisfy_official_msix_update() {
-        let local = claude::ClaudePackageStatus {
-            package_full_name: "AnthropicClaude_1.15962.1_x64".into(),
-            package_family_name: claude::CLAUDE_LOCAL_PACKAGE_FAMILY.into(),
-            version: "1.15962.1".into(),
-            architecture: "X64".into(),
-            install_location: r"C:\Users\me\AppData\Local\AnthropicClaude\app-1.15962.1".into(),
-            signature_kind: None,
-        };
+    fn appx_install_satisfies_official_msix_when_version_is_current() {
         let appx = claude::ClaudePackageStatus {
             package_full_name: "Claude_1.15962.1.0_x64__pzs8sxrjxfjjc".into(),
             package_family_name: claude::CLAUDE_PACKAGE_FAMILY.into(),
@@ -1562,20 +1822,14 @@ mod tests {
             signature_kind: Some("Store".into()),
         };
 
-        assert!(!current_install_satisfies_official_msix(
-            &local,
-            "1.15962.1"
-        ));
         assert!(current_install_satisfies_official_msix(&appx, "1.15962.1"));
     }
 
     #[test]
-    fn msix_install_sources_require_elevation() {
+    fn official_msix_install_requires_elevation() {
         let mut opts = GuiOptions {
             mode: InstallMode::User,
             root: PathBuf::from(r"C:\Users\me\AppData\Local\ClaudeDesktopUpdater"),
-            source: Fetcher::Winget,
-            msix_path: None,
             create_shortcut: true,
             register_uninstall: true,
             keep_downloads: false,
@@ -1583,11 +1837,36 @@ mod tests {
         };
 
         assert!(install_requires_elevation(&opts));
-        opts.source = Fetcher::LocalMsix;
-        assert!(install_requires_elevation(&opts));
-        opts.source = Fetcher::ExtractDiagnostic;
-        assert!(!install_requires_elevation(&opts));
         opts.mode = InstallMode::System;
         assert!(install_requires_elevation(&opts));
+    }
+
+    #[test]
+    fn selected_install_directory_contains_claude_desktop_updater_folder() {
+        assert_eq!(
+            normalize_install_root(PathBuf::from(r"D:\Tools")),
+            PathBuf::from(r"D:\Tools\ClaudeDesktopUpdater")
+        );
+        assert_eq!(
+            normalize_install_root(PathBuf::from(r"D:\Tools\ClaudeDesktopUpdater")),
+            PathBuf::from(r"D:\Tools\ClaudeDesktopUpdater")
+        );
+    }
+
+    #[test]
+    fn legacy_msix_cli_args_are_unsupported() {
+        let args = vec![
+            "--msix".to_string(),
+            r"D:\Downloads\Claude.msix".to_string(),
+        ];
+        let err = reject_unsupported_legacy_cli(&args).unwrap_err();
+        assert!(err.to_string().contains("no longer supported"));
+        assert!(err.to_string().contains("--update"));
+
+        let args = vec![
+            "--extract-msix".to_string(),
+            r"D:\Downloads\Claude.msix".to_string(),
+        ];
+        assert!(reject_unsupported_legacy_cli(&args).is_err());
     }
 }
