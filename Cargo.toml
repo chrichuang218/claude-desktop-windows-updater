@@ -18,7 +18,7 @@ anyhow = "1"
 thiserror = "2"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-native-roots", "json"] }
 directories = "5"
-quick-xml = "0.36"
+quick-xml = "0.39"
 encoding_rs = "0.8"
 
 [target.'cfg(windows)'.dependencies]
